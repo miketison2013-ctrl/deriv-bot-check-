@@ -1,5 +1,6 @@
 import streamlit as st
 from deriv_client import DerivClient
+from strategy import moving_average, crossover_signal
 
 st.set_page_config(
     page_title="Deriv Trading Dashboard",
@@ -7,111 +8,125 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📈 Deriv Trading Dashboard")
-st.caption("Account connection and controlled contract purchases")
-
+st.title("Deriv Trading Dashboard")
 st.warning(
-    "Trading involves risk. Start with a demo account. "
-    "This version does not automatically analyse markets or guarantee profits."
+    "Trading is risky. Use demo mode first. "
+    "Market analysis is informational and does not guarantee profit."
 )
 
-# ---------------- ACCOUNT SETTINGS ----------------
+# ---------------- ACCOUNT CONNECTION ----------------
 
 with st.sidebar:
-    st.header("Deriv connection")
-
+    st.header("Account connection")
     app_id = st.text_input("Deriv App ID")
-
-    account_mode = st.radio(
-        "Select ONE account to use",
-        ["Demo", "Real"],
-        index=0,
-    )
 
     demo_token = st.text_input(
         "Demo API token",
         type="password",
     )
-
     real_token = st.text_input(
         "Real API token",
         type="password",
     )
 
-    st.caption(
-        "Never save API tokens in GitHub files or share them in chat."
+    account_mode = st.radio(
+        "Account used for trading",
+        ["Demo", "Real"],
+        index=0,
     )
 
-token = demo_token.strip() if account_mode == "Demo" else real_token.strip()
+    st.caption(
+        "Keep tokens private. Never commit tokens to GitHub."
+    )
+
+selected_token = (
+    demo_token.strip()
+    if account_mode == "Demo"
+    else real_token.strip()
+)
 
 
-def get_client():
+def client_for(token):
     if not app_id.strip():
         raise ValueError("Enter your Deriv App ID.")
-
-    if not token:
-        raise ValueError(
-            f"Enter the API token for your selected {account_mode} account."
-        )
-
-    return DerivClient(app_id=app_id, token=token)
+    if not token.strip():
+        raise ValueError("Enter the API token for this account.")
+    return DerivClient(app_id, token)
 
 
-def display_error(label, error):
+def selected_client():
+    return client_for(selected_token)
+
+
+def show_error(label, error):
     st.error(f"{label}: {error}")
 
 
-# ---------------- SESSION STATE ----------------
+# ---------------- SESSION DATA ----------------
 
-if "markets" not in st.session_state:
+defaults = {
+    "markets": [],
+    "contracts": {},
+    "loaded_market": "",
+    "last_trade": None,
+}
+
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# Do not store the token in session state keys.
+account_fingerprint = (
+    account_mode,
+    app_id.strip(),
+    bool(selected_token),
+)
+
+if st.session_state.get("account_fingerprint") != account_fingerprint:
+    st.session_state.account_fingerprint = account_fingerprint
     st.session_state.markets = []
-
-if "contracts" not in st.session_state:
     st.session_state.contracts = {}
-
-if "loaded_market" not in st.session_state:
     st.session_state.loaded_market = ""
-
-if "last_trade" not in st.session_state:
     st.session_state.last_trade = None
 
-# Reset market data when the selected account changes.
-account_key = f"{account_mode}:{app_id.strip()}:{token}"
 
-if st.session_state.get("account_key") != account_key:
-    st.session_state.account_key = account_key
-    st.session_state.markets = []
-    st.session_state.contracts = {}
-    st.session_state.loaded_market = ""
-    st.session_state.last_trade = None
+# ---------------- BALANCES ----------------
 
+st.header("1. Account balances")
+left, right = st.columns(2)
 
-# ---------------- BALANCE ----------------
+with left:
+    st.subheader("Demo account")
+    if st.button("Check demo balance"):
+        try:
+            details = client_for(demo_token).get_balance()
+            st.success(f'Account: {details["loginid"]}')
+            st.metric(
+                "Demo balance",
+                f'{details["balance"]:.2f} {details["currency"]}',
+            )
+        except Exception as error:
+            show_error("Demo balance failed", error)
 
-st.header("1. Account balance")
+with right:
+    st.subheader("Real account")
+    if st.button("Check real balance"):
+        try:
+            details = client_for(real_token).get_balance()
+            st.success(f'Account: {details["loginid"]}')
+            st.metric(
+                "Real balance",
+                f'{details["balance"]:.2f} {details["currency"]}',
+            )
+        except Exception as error:
+            show_error("Real balance failed", error)
 
-st.write("Selected account:", f"**{account_mode.upper()}**")
+st.info(f"Selected trading account: {account_mode.upper()}")
 
 if account_mode == "Real":
-    st.error("REAL ACCOUNT: purchases can use real money.")
-
-if st.button("Connect and check balance"):
-    try:
-        details = get_client().get_balance()
-
-        st.success("Account connection successful.")
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric("Account ID", details["loginid"])
-        col2.metric(
-            "Balance",
-            f'{details["balance"]:.2f}',
-        )
-        col3.metric("Currency", details["currency"] or "Unknown")
-
-    except Exception as error:
-        display_error("Balance request failed", error)
+    st.error(
+        "REAL ACCOUNT SELECTED. Any confirmed purchase may risk real money."
+    )
 
 
 # ---------------- MARKETS ----------------
@@ -119,79 +134,99 @@ if st.button("Connect and check balance"):
 st.divider()
 st.header("2. Available markets")
 
-if st.button("Load markets"):
+if st.button("Refresh market list"):
     try:
-        client = get_client()
-        markets = client.get_active_symbols()
-
-        st.session_state.markets = markets
+        st.session_state.markets = selected_client().get_active_symbols()
         st.session_state.contracts = {}
         st.session_state.loaded_market = ""
-
-        if markets:
-            st.success(f"Loaded {len(markets)} available markets.")
-        else:
-            st.warning(
-                "No markets were returned. Check the API response "
-                "and account connection."
-            )
-
+        st.success(
+            f'{len(st.session_state.markets)} markets loaded.'
+        )
     except Exception as error:
-        display_error("Market loading failed", error)
-
+        show_error("Market loading failed", error)
 
 markets = st.session_state.markets
 
 if markets:
-    market_options = {
-        f'{market["display_name"]} ({market["symbol"]})':
-        market["symbol"]
-        for market in markets
+    options = {
+        f'{m["display_name"]} ({m["symbol"]})': m["symbol"]
+        for m in markets
     }
 
     market_label = st.selectbox(
-        "Choose a market",
-        list(market_options.keys()),
+        "Choose market",
+        list(options.keys()),
     )
-
-    symbol = market_options[market_label]
+    symbol = options[market_label]
 
     if symbol != st.session_state.loaded_market:
-        st.session_state.contracts = {}
         st.session_state.loaded_market = symbol
+        st.session_state.contracts = {}
 
-    if st.button("Load available digit contracts"):
+    if st.button("Load supported digit contracts"):
         try:
             st.session_state.contracts = (
-                get_client().get_contract_types(symbol)
+                selected_client().get_contract_types(symbol)
             )
-
             if st.session_state.contracts:
-                st.success("Available contract types loaded.")
+                st.success("Contract types loaded.")
             else:
                 st.warning(
-                    "This market returned no supported digit contracts."
+                    "No supported digit contracts were returned for this market."
                 )
-
         except Exception as error:
-            display_error("Contract loading failed", error)
+            show_error("Contract loading failed", error)
 
-    # ---------------- CONTRACT SETTINGS ----------------
+    # ---------------- MARKET ANALYSIS ----------------
+
+    st.subheader("Market analysis")
+
+    if st.button("Analyse recent ticks"):
+        try:
+            data = selected_client().get_recent_ticks(symbol, 100)
+            prices = data["prices"]
+
+            if len(prices) < 11:
+                st.warning("Not enough tick history for this analysis.")
+            else:
+                fast_ma = moving_average(prices, 5)
+                slow_ma = moving_average(prices, 10)
+                signal = crossover_signal(prices, 5, 10)
+
+                a, b, c = st.columns(3)
+                a.metric("Latest quote", f"{prices[-1]:.5f}")
+                b.metric("5-tick average", f"{fast_ma:.5f}")
+                c.metric("10-tick average", f"{slow_ma:.5f}")
+
+                if signal == "UP":
+                    st.success("Moving-average crossover: UP")
+                elif signal == "DOWN":
+                    st.warning("Moving-average crossover: DOWN")
+                else:
+                    st.info("Moving-average crossover: WAIT")
+
+                st.caption(
+                    "This is a simple indicator, not a prediction "
+                    "or a recommendation to place a trade."
+                )
+        except Exception as error:
+            show_error("Analysis failed", error)
+
+    # ---------------- ORDER SETTINGS ----------------
 
     contracts = st.session_state.contracts
 
     if contracts:
         st.divider()
-        st.header("3. Order settings")
+        st.header("3. Manual order")
 
         contract_label = st.selectbox(
             "Contract type",
             list(contracts.keys()),
         )
-
         contract_code = contracts[contract_label]
 
-        requires_digit = contract_code in {
+        needs_digit = contract_code in {
             "DIGITOVER",
             "DIGITUNDER",
             "DIGITMATCH",
@@ -199,8 +234,7 @@ if markets:
         }
 
         digit = None
-
-        if requires_digit:
+        if needs_digit:
             digit = st.number_input(
                 "Prediction digit",
                 min_value=0,
@@ -233,67 +267,116 @@ if markets:
         st.write("Market:", symbol)
         st.write("Contract:", contract_label)
         st.write("Account:", account_mode.upper())
-        st.write("Stake:", stake, currency)
+        st.write("Stake:", f"{stake:.2f} {currency}")
 
         if account_mode == "Real":
             st.error(
-                "You selected REAL trading. Check every setting "
-                "before continuing."
+                "Real trading is selected. Verify account, market, "
+                "contract, stake and duration before buying."
             )
 
-        confirmation = st.checkbox(
-            f"I confirm one {account_mode.upper()} purchase "
-            "using the settings shown above."
+        confirm = st.checkbox(
+            f"I confirm ONE {account_mode.upper()} purchase "
+            "with the settings above."
         )
 
         if st.button("Buy ONE contract", type="primary"):
-            if not confirmation:
-                st.error("Confirm the order first.")
-
-            elif not currency:
-                st.error("Enter your account currency.")
-
+            if not confirm:
+                st.error("Confirm the order before buying.")
             else:
                 try:
-                    result = get_client().buy_digit_contract(
+                    result = selected_client().buy_digit_contract(
                         symbol=symbol,
                         contract_type=contract_code,
                         stake=float(stake),
                         currency=currency,
                         duration_ticks=int(duration),
-                        barrier=int(digit) if requires_digit else None,
+                        barrier=int(digit) if needs_digit else None,
                     )
-
                     st.session_state.last_trade = result
-
-                    st.success(
-                        "Deriv returned a purchase confirmation."
-                    )
-
+                    st.success("Deriv confirmed the purchase.")
                 except Exception as error:
-                    display_error("Purchase failed", error)
-
-
-# ---------------- LAST PURCHASE ----------------
+                    show_error("Purchase failed", error)
 
 if st.session_state.last_trade:
     st.divider()
-    st.header("Latest purchase confirmation")
-
+    st.header("Latest purchase")
     trade = st.session_state.last_trade
-
     st.write("Contract ID:", trade["contract_id"])
     st.write("Account ID:", trade["loginid"])
     st.write("Purchase price:", trade["buy_price"])
     st.write("Potential payout:", trade["payout"])
+    st.write("Details:", trade.get("longcode", ""))
 
-    if trade.get("longcode"):
-        st.write("Contract details:", trade["longcode"])
 
-    st.info(
-        "A purchase confirmation does not mean the contract has settled "
-        "or made a profit. Check the contract in Deriv's trade history."
+# ---------------- OPEN POSITIONS ----------------
+
+st.divider()
+st.header("4. Open positions")
+
+if st.button("Refresh open positions"):
+    try:
+        positions = selected_client().get_open_positions()
+        st.session_state.open_positions = positions
+
+        if positions:
+            st.success(f"{len(positions)} open position(s).")
+        else:
+            st.info("No open positions were returned.")
+    except Exception as error:
+        show_error("Position request failed", error)
+
+positions = st.session_state.get("open_positions", [])
+
+if positions:
+    st.dataframe(positions, use_container_width=True)
+
+    ids = [
+        str(p.get("contract_id"))
+        for p in positions
+        if p.get("contract_id") is not None
+    ]
+
+    if ids:
+        selected_id = st.selectbox(
+            "Check a contract",
+            ids,
+        )
+
+        if st.button("Check contract status"):
+            try:
+                status = selected_client().get_contract_status(
+                    selected_id
+                )
+                st.json(status)
+            except Exception as error:
+                show_error("Contract status failed", error)
+
+
+# ---------------- TRANSACTION HISTORY ----------------
+
+st.divider()
+st.header("5. Account transaction history")
+
+if st.button("Load recent transactions"):
+    try:
+        transactions = selected_client().get_statement(25)
+        st.session_state.transactions = transactions
+
+        if transactions:
+            st.dataframe(transactions, use_container_width=True)
+        else:
+            st.info("No transactions were returned.")
+    except Exception as error:
+        show_error("Transaction history failed", error)
+
+if st.session_state.get("transactions"):
+    st.dataframe(
+        st.session_state.transactions,
+        use_container_width=True,
     )
 
-else:
-    st.caption("No purchase confirmation in this session.")
+st.caption(
+    "Open positions and transaction history are fetched on request. "
+    "This dashboard does not run continuously in the background."
+)
