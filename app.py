@@ -1,172 +1,207 @@
-
 import streamlit as st
-from deriv_client import DerivClient, DerivAPIError
+from deriv_client import DerivClient
 
 st.set_page_config(
-    page_title="Deriv Volatility Bot",
+    page_title="Deriv Trading Dashboard",
     page_icon="📈",
     layout="wide",
 )
 
 st.title("📈 Deriv Trading Dashboard")
-st.caption("Live account connection and controlled digit-contract orders")
+st.caption("Account connection and controlled contract purchases")
 
 st.warning(
-    "Real trading risks losing your stake. This version places a trade "
-    "only when you press the purchase button. It does not guarantee profit."
+    "Trading involves risk. Start with a demo account. "
+    "This version does not automatically analyse markets or guarantee profits."
 )
 
-with st.sidebar:
-    st.header("API connection")
+# ---------------- ACCOUNT SETTINGS ----------------
 
-    app_id = st.text_input(
-        "Deriv App ID",
-        value="",
-        help="Enter your registered Deriv application ID.",
+with st.sidebar:
+    st.header("Deriv connection")
+
+    app_id = st.text_input("Deriv App ID")
+
+    account_mode = st.radio(
+        "Select ONE account to use",
+        ["Demo", "Real"],
+        index=0,
     )
 
     demo_token = st.text_input(
         "Demo API token",
         type="password",
-        help="Use a token belonging to your demo account.",
     )
 
     real_token = st.text_input(
         "Real API token",
         type="password",
-        help="Use a token belonging to your real account.",
-    )
-
-    account_mode = st.radio(
-        "Account to use",
-        ["Demo", "Real"],
-        index=0,
     )
 
     st.caption(
-        "Tokens are entered in this session only. Never commit them "
-        "to GitHub or share them in chat."
+        "Never save API tokens in GitHub files or share them in chat."
     )
 
-selected_token = demo_token if account_mode == "Demo" else real_token
+token = demo_token.strip() if account_mode == "Demo" else real_token.strip()
 
-def make_client(token):
+
+def get_client():
+    if not app_id.strip():
+        raise ValueError("Enter your Deriv App ID.")
+
+    if not token:
+        raise ValueError(
+            f"Enter the API token for your selected {account_mode} account."
+        )
+
     return DerivClient(app_id=app_id, token=token)
 
-def show_error(error):
-    st.error(str(error))
 
-if "symbols" not in st.session_state:
-    st.session_state.symbols = []
+def display_error(label, error):
+    st.error(f"{label}: {error}")
 
-if "contract_types" not in st.session_state:
-    st.session_state.contract_types = {}
 
-if "trade_result" not in st.session_state:
-    st.session_state.trade_result = None
+# ---------------- SESSION STATE ----------------
 
-left, right = st.columns(2)
+if "markets" not in st.session_state:
+    st.session_state.markets = []
 
-with left:
-    st.subheader("Account balances")
+if "contracts" not in st.session_state:
+    st.session_state.contracts = {}
 
-    if st.button("Connect and refresh balances"):
-        if not app_id.strip():
-            st.error("Enter your Deriv App ID.")
-        elif not demo_token.strip() and not real_token.strip():
-            st.error("Enter at least one account token.")
-        else:
-            for label, token in [
-                ("Demo", demo_token),
-                ("Real", real_token),
-            ]:
-                if not token.strip():
-                    st.info(f"{label}: no token entered.")
-                    continue
+if "loaded_market" not in st.session_state:
+    st.session_state.loaded_market = ""
 
-                try:
-                    details = make_client(token).get_balance()
-                    st.write(
-                        f"{label} account: {details['loginid']} — "
-                        f"{details['balance']:.2f} "
-                        f"{details['currency']}"
-                    )
-                except Exception as error:
-                    st.error(f"{label} account: {error}")
+if "last_trade" not in st.session_state:
+    st.session_state.last_trade = None
 
-with right:
-    st.subheader("Selected account")
+# Reset market data when the selected account changes.
+account_key = f"{account_mode}:{app_id.strip()}:{token}"
 
-    st.metric("Mode", account_mode.upper())
+if st.session_state.get("account_key") != account_key:
+    st.session_state.account_key = account_key
+    st.session_state.markets = []
+    st.session_state.contracts = {}
+    st.session_state.loaded_market = ""
+    st.session_state.last_trade = None
 
-    if account_mode == "Real":
-        st.warning("REAL account selected.")
 
-    st.write(
-        "Only the token for the selected account is used for "
-        "the purchase request."
-    )
+# ---------------- BALANCE ----------------
+
+st.header("1. Account balance")
+
+st.write("Selected account:", f"**{account_mode.upper()}**")
+
+if account_mode == "Real":
+    st.error("REAL ACCOUNT: purchases can use real money.")
+
+if st.button("Connect and check balance"):
+    try:
+        details = get_client().get_balance()
+
+        st.success("Account connection successful.")
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric("Account ID", details["loginid"])
+        col2.metric(
+            "Balance",
+            f'{details["balance"]:.2f}',
+        )
+        col3.metric("Currency", details["currency"] or "Unknown")
+
+    except Exception as error:
+        display_error("Balance request failed", error)
+
+
+# ---------------- MARKETS ----------------
 
 st.divider()
-st.header("Market and contract settings")
+st.header("2. Available markets")
 
-if st.button("Load available markets"):
-    if not app_id.strip() or not selected_token.strip():
-        st.error("Enter the App ID and token for the selected account.")
-    else:
-        try:
-            client = make_client(selected_token)
-            st.session_state.symbols = client.get_active_symbols()
-            st.session_state.contract_types = {}
-            st.success(
-                f"Loaded {len(st.session_state.symbols)} active markets."
+if st.button("Load markets"):
+    try:
+        client = get_client()
+        markets = client.get_active_symbols()
+
+        st.session_state.markets = markets
+        st.session_state.contracts = {}
+        st.session_state.loaded_market = ""
+
+        if markets:
+            st.success(f"Loaded {len(markets)} available markets.")
+        else:
+            st.warning(
+                "No markets were returned. Check the API response "
+                "and account connection."
             )
-        except Exception as error:
-            show_error(error)
 
-symbols = st.session_state.symbols
+    except Exception as error:
+        display_error("Market loading failed", error)
 
-if not symbols:
-    st.info("Connect your selected account, then load available markets.")
-else:
-    symbol_labels = {
-        f"{item['display_name']} ({item['symbol']})": item["symbol"]
-        for item in symbols
+
+markets = st.session_state.markets
+
+if markets:
+    market_options = {
+        f'{market["display_name"]} ({market["symbol"]})':
+        market["symbol"]
+        for market in markets
     }
 
     market_label = st.selectbox(
-        "Market",
-        list(symbol_labels.keys()),
+        "Choose a market",
+        list(market_options.keys()),
     )
-    symbol = symbol_labels[market_label]
 
-    if st.button("Load supported digit contracts"):
+    symbol = market_options[market_label]
+
+    if symbol != st.session_state.loaded_market:
+        st.session_state.contracts = {}
+        st.session_state.loaded_market = symbol
+
+    if st.button("Load available digit contracts"):
         try:
-            client = make_client(selected_token)
-            st.session_state.contract_types = (
-                client.get_contract_types(symbol)
+            st.session_state.contracts = (
+                get_client().get_contract_types(symbol)
             )
-            st.success("Contract types refreshed for this market.")
+
+            if st.session_state.contracts:
+                st.success("Available contract types loaded.")
+            else:
+                st.warning(
+                    "This market returned no supported digit contracts."
+                )
+
         except Exception as error:
-            show_error(error)
+            display_error("Contract loading failed", error)
 
-    types = st.session_state.contract_types
+    # ---------------- CONTRACT SETTINGS ----------------
 
-    if types:
+    contracts = st.session_state.contracts
+
+    if contracts:
+        st.divider()
+        st.header("3. Order settings")
+
         contract_label = st.selectbox(
             "Contract type",
-            list(types.keys()),
+            list(contracts.keys()),
         )
-        contract_code = types[contract_label]
 
-        needs_digit = contract_code in {
-            "DIGITOVER", "DIGITUNDER",
-            "DIGITMATCH", "DIGITDIFF",
+        contract_code = contracts[contract_label]
+
+        requires_digit = contract_code in {
+            "DIGITOVER",
+            "DIGITUNDER",
+            "DIGITMATCH",
+            "DIGITDIFF",
         }
 
-        barrier = None
-        if needs_digit:
-            barrier = st.number_input(
+        digit = None
+
+        if requires_digit:
+            digit = st.number_input(
                 "Prediction digit",
                 min_value=0,
                 max_value=9,
@@ -177,80 +212,88 @@ else:
         currency = st.text_input(
             "Account currency",
             value="USD",
-            help=(
-                "Use the currency shown for your selected Deriv account, "
-                "for example USD or EUR."
-            ),
         ).strip().upper()
 
         stake = st.number_input(
-            "Stake per trade",
+            "Stake",
             min_value=0.35,
             max_value=10.0,
             value=0.35,
             step=0.05,
         )
 
-        duration_ticks = st.number_input(
-            "Contract duration (ticks)",
+        duration = st.number_input(
+            "Duration in ticks",
             min_value=1,
             max_value=10,
             value=1,
             step=1,
         )
 
-        st.caption(
-            "This order uses the selected account, market, contract, "
-            "stake and duration. Confirm all settings before buying."
+        st.write("Market:", symbol)
+        st.write("Contract:", contract_label)
+        st.write("Account:", account_mode.upper())
+        st.write("Stake:", stake, currency)
+
+        if account_mode == "Real":
+            st.error(
+                "You selected REAL trading. Check every setting "
+                "before continuing."
+            )
+
+        confirmation = st.checkbox(
+            f"I confirm one {account_mode.upper()} purchase "
+            "using the settings shown above."
         )
 
-        confirmed = st.checkbox(
-            "I have checked the settings and authorize one real order"
-            if account_mode == "Real"
-            else "I understand this will place an actual demo order"
-        )
+        if st.button("Buy ONE contract", type="primary"):
+            if not confirmation:
+                st.error("Confirm the order first.")
 
-        if st.button("Buy one contract", type="primary"):
-            if not app_id.strip() or not selected_token.strip():
-                st.error("Enter the selected account's API details.")
             elif not currency:
-                st.error("Enter the account currency.")
-            elif not confirmed:
-                st.error("Tick the confirmation box before buying.")
+                st.error("Enter your account currency.")
+
             else:
                 try:
-                    client = make_client(selected_token)
-                    result = client.buy_digit_contract(
+                    result = get_client().buy_digit_contract(
                         symbol=symbol,
                         contract_type=contract_code,
                         stake=float(stake),
                         currency=currency,
-                        duration_ticks=int(duration_ticks),
-                        barrier=int(barrier) if needs_digit else None,
+                        duration_ticks=int(duration),
+                        barrier=int(digit) if requires_digit else None,
                     )
 
-                    st.session_state.trade_result = result
-                    st.success("Deriv returned a purchase confirmation.")
+                    st.session_state.last_trade = result
+
+                    st.success(
+                        "Deriv returned a purchase confirmation."
+                    )
 
                 except Exception as error:
-                    st.session_state.trade_result = None
-                    show_error(error)
+                    display_error("Purchase failed", error)
 
-if st.session_state.trade_result:
+
+# ---------------- LAST PURCHASE ----------------
+
+if st.session_state.last_trade:
     st.divider()
-    st.subheader("Latest purchase confirmation")
-    result = st.session_state.trade_result
+    st.header("Latest purchase confirmation")
 
-    st.write("Contract ID:", result["contract_id"])
-    st.write("Account:", result["loginid"])
-    st.write("Buy price:", result["buy_price"])
-    st.write("Potential payout:", result["payout"])
+    trade = st.session_state.last_trade
 
-    if result.get("longcode"):
-        st.write("Contract details:", result["longcode"])
+    st.write("Contract ID:", trade["contract_id"])
+    st.write("Account ID:", trade["loginid"])
+    st.write("Purchase price:", trade["buy_price"])
+    st.write("Potential payout:", trade["payout"])
 
-    st.caption(
-        "Keep the contract ID to check the trade in Deriv's own "
-        "trade history. A purchase confirmation alone is not a "
-        "settlement or proof of profit."
+    if trade.get("longcode"):
+        st.write("Contract details:", trade["longcode"])
+
+    st.info(
+        "A purchase confirmation does not mean the contract has settled "
+        "or made a profit. Check the contract in Deriv's trade history."
     )
+
+else:
+    st.caption("No purchase confirmation in this session.")
