@@ -1,4 +1,3 @@
-
 import json
 import websocket
 
@@ -9,53 +8,68 @@ class DerivAPIError(Exception):
 
 class DerivClient:
     def __init__(self, app_id, token=None):
-        self.app_id = str(app_id).strip()
+        self.app_id = str(app_id or "").strip()
         self.token = (token or "").strip()
 
         if not self.app_id.isdigit():
-            raise DerivAPIError("The Deriv App ID must be numeric.")
+            raise DerivAPIError("Enter a valid numeric Deriv App ID.")
 
         if not self.token:
-            raise DerivAPIError("Enter the API token for the selected account.")
+            raise DerivAPIError("Enter the API token for your selected account.")
+
+    def _open(self):
+        url = f"wss://ws.derivws.com/websockets/v3?app_id={self.app_id}"
+
+        try:
+            return websocket.create_connection(url, timeout=20)
+        except Exception as exc:
+            raise DerivAPIError(
+                f"Could not connect to Deriv: {exc}"
+            ) from exc
 
     def _send_receive(self, ws, payload):
+        req_id = payload.get("req_id")
         ws.send(json.dumps(payload))
 
         while True:
-            raw = ws.recv()
-            data = json.loads(raw)
+            try:
+                response = json.loads(ws.recv())
+            except Exception as exc:
+                raise DerivAPIError(
+                    f"Invalid response from Deriv: {exc}"
+                ) from exc
 
-            if data.get("error"):
-                message = data["error"].get("message", "Deriv API error")
-                raise DerivAPIError(message)
+            if response.get("error"):
+                raise DerivAPIError(
+                    response["error"].get("message", "Deriv API error")
+                )
 
-            if data.get("req_id") == payload.get("req_id"):
-                return data
-
-    def _open(self):
-        url = (
-            "wss://ws.derivws.com/websockets/v3"
-            f"?app_id={self.app_id}"
-        )
-        return websocket.create_connection(url, timeout=15)
+            if req_id is None or response.get("req_id") == req_id:
+                return response
 
     def _authenticated_request(self, payload):
         ws = self._open()
 
         try:
-            auth = self._send_receive(
+            auth_response = self._send_receive(
                 ws,
                 {"authorize": self.token, "req_id": 1},
             )
 
-            if not auth.get("authorize"):
-                raise DerivAPIError("Deriv authorization failed.")
+            account = auth_response.get("authorize")
 
-            result = self._send_receive(
+            if not account:
+                raise DerivAPIError(
+                    "Deriv did not confirm account authorization."
+                )
+
+            response = self._send_receive(
                 ws,
                 {**payload, "req_id": 2},
             )
-            return auth["authorize"], result
+
+            return account, response
+
         finally:
             ws.close()
 
@@ -65,36 +79,61 @@ class DerivClient:
         )
 
         balance = response.get("balance", {})
+
         return {
             "loginid": account.get("loginid", "Unknown"),
-            "currency": balance.get(
-                "currency", account.get("currency", "")
-            ),
+            "currency": balance.get("currency")
+            or account.get("currency", ""),
             "balance": float(balance.get("balance", 0)),
         }
 
     def get_active_symbols(self):
         _, response = self._authenticated_request(
-            {"active_symbols": "brief"}
+            {
+                "active_symbols": "brief",
+                "product_type": "basic",
+            }
         )
 
-        symbols = response.get("active_symbols", [])
+        markets = response.get("active_symbols", [])
+        normalized = {}
 
-        return [
-            item for item in symbols
-            if item.get("symbol") and item.get("display_name")
-        ]
+        for market in markets:
+            # Accept both older and newer market field names.
+            symbol = (
+                market.get("symbol")
+                or market.get("underlying_symbol")
+            )
+
+            name = (
+                market.get("display_name")
+                or market.get("underlying_symbol_name")
+                or market.get("underlying_symbol")
+                or symbol
+            )
+
+            if symbol and name:
+                normalized[symbol] = {
+                    **market,
+                    "symbol": symbol,
+                    "display_name": name,
+                }
+
+        return sorted(
+            normalized.values(),
+            key=lambda item: item["display_name"].lower(),
+        )
 
     def get_contract_types(self, symbol):
         _, response = self._authenticated_request(
             {"contracts_for": symbol}
         )
 
-        contracts = response.get("contracts_for", {}).get(
-            "available", []
-        )
+        contracts = response.get(
+            "contracts_for", {}
+        ).get("available", [])
 
-        supported = {
+        labels = {
             "DIGITOVER": "Over",
             "DIGITUNDER": "Under",
             "DIGITMATCH": "Matches",
@@ -103,14 +142,15 @@ class DerivClient:
             "DIGITODD": "Odd",
         }
 
-        result = {}
+        supported = {}
 
         for contract in contracts:
             code = contract.get("contract_type")
-            if code in supported:
-                result[supported[code]] = code
 
-        return result
+            if code in labels:
+                supported[labels[code]] = code
+
+        return supported
 
     def buy_digit_contract(
         self,
@@ -133,35 +173,48 @@ class DerivClient:
         if contract_type not in allowed:
             raise DerivAPIError("Unsupported digit contract type.")
 
-        if stake <= 0:
+        if not symbol:
+            raise DerivAPIError("Select a market first.")
+
+        if float(stake) <= 0:
             raise DerivAPIError("Stake must be greater than zero.")
 
         if not 1 <= int(duration_ticks) <= 10:
-            raise DerivAPIError("Duration must be between 1 and 10 ticks.")
+            raise DerivAPIError(
+                "Duration must be between 1 and 10 ticks."
+            )
+
+        if not currency:
+            raise DerivAPIError("Enter the account currency.")
 
         needs_digit = contract_type in {
-            "DIGITOVER", "DIGITUNDER",
-            "DIGITMATCH", "DIGITDIFF",
+            "DIGITOVER",
+            "DIGITUNDER",
+            "DIGITMATCH",
+            "DIGITDIFF",
         }
 
         if needs_digit and (
             barrier is None or not 0 <= int(barrier) <= 9
         ):
             raise DerivAPIError(
-                "This contract requires a prediction digit from 0 to 9."
+                "Enter a prediction digit from 0 to 9."
             )
 
         ws = self._open()
 
         try:
-            auth = self._send_receive(
+            auth_response = self._send_receive(
                 ws,
                 {"authorize": self.token, "req_id": 1},
             )
 
-            account = auth.get("authorize", {})
+            account = auth_response.get("authorize")
+
             if not account:
-                raise DerivAPIError("Deriv authorization failed.")
+                raise DerivAPIError(
+                    "Deriv authorization failed."
+                )
 
             proposal = {
                 "proposal": 1,
@@ -178,38 +231,43 @@ class DerivClient:
             if needs_digit:
                 proposal["barrier"] = str(int(barrier))
 
-            price_response = self._send_receive(ws, proposal)
-            offer = price_response.get("proposal", {})
-            proposal_id = offer.get("id")
-            ask_price = float(offer.get("ask_price", 0))
+            proposal_response = self._send_receive(
+                ws, proposal
+            )
 
-            if not proposal_id or ask_price <= 0:
+            offer = proposal_response.get("proposal", {})
+            proposal_id = offer.get("id")
+            ask_price = offer.get("ask_price")
+
+            if not proposal_id or ask_price is None:
                 raise DerivAPIError(
                     "Deriv did not return a valid trade proposal."
                 )
 
-            purchase = self._send_receive(
+            purchase_response = self._send_receive(
                 ws,
                 {
                     "buy": proposal_id,
-                    "price": ask_price,
+                    "price": float(ask_price),
                     "req_id": 3,
                 },
             )
 
-            bought = purchase.get("buy", {})
+            bought = purchase_response.get("buy", {})
+            contract_id = bought.get("contract_id")
 
-            if not bought.get("contract_id"):
+            if not contract_id:
                 raise DerivAPIError(
-                    "Purchase confirmation was not received."
+                    "Deriv did not confirm the purchase."
                 )
 
             return {
-                "contract_id": bought["contract_id"],
+                "contract_id": contract_id,
                 "buy_price": bought.get("buy_price"),
                 "payout": bought.get("payout"),
                 "longcode": bought.get("longcode", ""),
                 "loginid": account.get("loginid", ""),
             }
+
         finally:
             ws.close()
