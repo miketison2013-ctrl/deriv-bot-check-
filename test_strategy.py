@@ -1,4 +1,3 @@
-
 import unittest
 
 from strategy import moving_average, crossover_signal
@@ -6,13 +5,23 @@ from strategy import moving_average, crossover_signal
 
 class StrategyTests(unittest.TestCase):
     def test_moving_average(self):
-        prices = [10, 20, 30, 40]
+        self.assertEqual(
+            moving_average([10, 20, 30, 40], 2),
+            35,
+        )
 
-        self.assertEqual(moving_average(prices, 2), 35)
-        self.assertEqual(moving_average(prices, 3), 30)
-        self.assertIsNone(moving_average(prices, 5))
+    def test_longer_moving_average(self):
+        self.assertEqual(
+            moving_average([10, 20, 30, 40], 3),
+            30,
+        )
 
-    def test_invalid_period(self):
+    def test_insufficient_prices(self):
+        self.assertIsNone(
+            moving_average([10, 20], 3)
+        )
+
+    def test_invalid_moving_average_period(self):
         with self.assertRaises(ValueError):
             moving_average([1, 2, 3], 0)
 
