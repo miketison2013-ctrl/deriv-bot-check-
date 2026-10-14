@@ -1,4 +1,3 @@
-
 name: Test Deriv Bot
 
 on:
@@ -18,5 +17,5 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run strategy tests
-        run: python -m unittest test_strategy -v
+      - name: Run all unit tests
+        run: python -m unittest discover -v
