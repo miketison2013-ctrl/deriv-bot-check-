@@ -1,12 +1,13 @@
 """
 Advanced statistical tools for the Deriv trading bot.
 
-This module analyses digit contracts and directional price data.
-It does not place trades or guarantee profitable predictions.
+Provides digit-contract analysis, probability estimates,
+expected-value calculations, and basic directional indicators.
+
+This module does not place trades or guarantee profits.
 """
 
-from collections import Counter
-from math import sqrt
+from math import isfinite, sqrt
 from statistics import mean
 from typing import Any, Dict, List, Optional
 
@@ -24,26 +25,14 @@ DIGIT_CONTRACTS = {
     "Under 9": ("DIGITUNDER", 9),
     "Even": ("DIGITEVEN", None),
     "Odd": ("DIGITODD", None),
-    "Matches 0": ("DIGITMATCH", 0),
-    "Matches 1": ("DIGITMATCH", 1),
-    "Matches 2": ("DIGITMATCH", 2),
-    "Matches 3": ("DIGITMATCH", 3),
-    "Matches 4": ("DIGITMATCH", 4),
-    "Matches 5": ("DIGITMATCH", 5),
-    "Matches 6": ("DIGITMATCH", 6),
-    "Matches 7": ("DIGITMATCH", 7),
-    "Matches 8": ("DIGITMATCH", 8),
-    "Matches 9": ("DIGITMATCH", 9),
-    "Differs 0": ("DIGITDIFF", 0),
-    "Differs 1": ("DIGITDIFF", 1),
-    "Differs 2": ("DIGITDIFF", 2),
-    "Differs 3": ("DIGITDIFF", 3),
-    "Differs 4": ("DIGITDIFF", 4),
-    "Differs 5": ("DIGITDIFF", 5),
-    "Differs 6": ("DIGITDIFF", 6),
-    "Differs 7": ("DIGITDIFF", 7),
-    "Differs 8": ("DIGITDIFF", 8),
-    "Differs 9": ("DIGITDIFF", 9),
+    **{
+        f"Matches {digit}": ("DIGITMATCH", digit)
+        for digit in range(10)
+    },
+    **{
+        f"Differs {digit}": ("DIGITDIFF", digit)
+        for digit in range(10)
+    },
 }
 
 
@@ -51,42 +40,58 @@ def last_digit_from_quote(
     quote: Any,
     pip_size: Optional[int] = None,
 ) -> Optional[int]:
-    """Extract the final displayed digit from a market quote."""
+    """
+    Extract the final displayed digit from a quote.
+
+    Supply pip_size from the market metadata whenever possible.
+    For example, 123.450 with pip_size=3 gives digit 0.
+    """
     try:
+        value = float(quote)
+
+        if not isfinite(value):
+            return None
+
         if pip_size is not None:
             precision = int(pip_size)
+
             if precision < 0 or precision > 10:
                 return None
 
-            formatted = f"{float(quote):.{precision}f}"
-            decimals = formatted.partition(".")[2]
-
-            if precision == 0:
-                return int(formatted[-1])
-
-            return int(decimals[-1])
+            formatted = f"{value:.{precision}f}"
+            return int(formatted[-1])
 
         text = str(quote).strip()
 
+        # Scientific notation does not reliably preserve the
+        # original displayed precision.
         if "e" in text.lower():
-            text = format(float(text), ".10f").rstrip("0").rstrip(".")
+            return None
 
-        text = text.rstrip("0") if "." in text else text
+        if not text:
+            return None
 
-        if "." not in text or not text:
-            return int(text[-1]) if text else None
+        if "." in text:
+            decimals = text.partition(".")[2]
 
-        decimals = text.partition(".")[2]
-        return int(decimals[-1]) if decimals else None
+            if not decimals.isdigit():
+                return None
+
+            return int(decimals[-1]) if decimals else None
+
+        if text.isdigit():
+            return int(text[-1])
+
+        return None
 
     except (ValueError, TypeError, OverflowError):
         return None
 
 
 def digit_event(label: str, digit: int) -> bool:
-    """Return whether a digit satisfies a named digit-contract condition."""
-    if digit not in range(10):
-        raise ValueError("digit must be between 0 and 9")
+    """Check whether a digit satisfies a named digit contract."""
+    if not isinstance(digit, int) or digit not in range(10):
+        raise ValueError("digit must be an integer from 0 to 9")
 
     if label not in DIGIT_CONTRACTS:
         raise ValueError(f"Unsupported digit contract: {label}")
@@ -116,9 +121,10 @@ def digit_event(label: str, digit: int) -> bool:
 
 def theoretical_probability(label: str) -> float:
     """
-    Calculate the simple equal-digit baseline probability.
+    Return the equal-digit baseline probability.
 
-    Actual outcomes and payouts must be verified for the selected market.
+    This is a mathematical baseline, not a prediction that
+    the next outcome will have that probability.
     """
     if label not in DIGIT_CONTRACTS:
         raise ValueError(f"Unsupported digit contract: {label}")
@@ -149,25 +155,29 @@ def beta_binomial_summary(
     prior_alpha: float = 1.0,
     prior_beta: float = 1.0,
 ) -> Dict[str, float]:
-    """
-    Estimate a binary strategy's win probability using a Beta prior.
+    """Estimate binary win probability with a Beta prior."""
+    if (
+        not isinstance(wins, int)
+        or not isinstance(losses, int)
+        or wins < 0
+        or losses < 0
+    ):
+        raise ValueError("wins and losses must be non-negative integers")
 
-    The interval is an approximate 95% interval, not a guarantee.
-    """
-    if wins < 0 or losses < 0:
-        raise ValueError("wins and losses cannot be negative")
-
-    if prior_alpha <= 0 or prior_beta <= 0:
-        raise ValueError("prior parameters must be positive")
+    if (
+        not isfinite(prior_alpha)
+        or not isfinite(prior_beta)
+        or prior_alpha <= 0
+        or prior_beta <= 0
+    ):
+        raise ValueError("Prior parameters must be finite and positive")
 
     alpha = prior_alpha + wins
     beta = prior_beta + losses
     total = alpha + beta
 
     probability = alpha / total
-    variance = (alpha * beta) / (
-        (total ** 2) * (total + 1)
-    )
+    variance = (alpha * beta) / (total ** 2 * (total + 1))
     margin = 1.96 * sqrt(variance)
 
     return {
@@ -187,47 +197,52 @@ def expected_value_per_stake(
     """
     Estimate net expected return per unit staked.
 
-    payout_multiple means total amount returned on a win,
-    including the original stake.
-
-    Example: 0.80 means a winning trade returns 0.80
-    units per 1 unit staked in total.
+    payout_multiple means total returned per unit staked
+    on a win, including the stake itself.
     """
-    if not 0 <= probability <= 1:
+    if not isfinite(probability) or not 0 <= probability <= 1:
         raise ValueError("probability must be between 0 and 1")
 
-    if payout_multiple < 0:
-        raise ValueError("payout_multiple cannot be negative")
+    if not isfinite(payout_multiple) or payout_multiple < 0:
+        raise ValueError("payout_multiple must be finite and non-negative")
 
-    return (probability * payout_multiple) - 1.0
+    return probability * payout_multiple - 1.0
 
 
 def rolling_digit_analysis(
     digits: List[int],
     contract_label: str,
 ) -> Dict[str, Any]:
-    """Summarise recent digits against a simple theoretical baseline."""
+    """Summarise observed digit-contract outcomes."""
     if contract_label not in DIGIT_CONTRACTS:
         raise ValueError(f"Unsupported digit contract: {contract_label}")
 
-    clean_digits = [int(d) for d in digits if int(d) in range(10)]
+    clean_digits = []
+
+    for digit in digits:
+        if isinstance(digit, bool) or not isinstance(digit, int):
+            continue
+
+        if digit in range(10):
+            clean_digits.append(digit)
+
+    baseline = theoretical_probability(contract_label)
 
     if not clean_digits:
         return {
             "sample_size": 0,
             "wins": 0,
             "observed_probability": None,
-            "baseline_probability": theoretical_probability(
-                contract_label
-            ),
+            "baseline_probability": baseline,
             "estimated_probability": None,
-            "warning": "Not enough valid digit observations.",
+            "warning": "No valid digit observations available.",
         }
 
     wins = sum(
-        1 for digit in clean_digits
-        if digit_event(contract_label, digit)
+        digit_event(contract_label, digit)
+        for digit in clean_digits
     )
+
     sample_size = len(clean_digits)
     observed = wins / sample_size
 
@@ -240,17 +255,13 @@ def rolling_digit_analysis(
         "sample_size": sample_size,
         "wins": wins,
         "observed_probability": observed,
-        "baseline_probability": theoretical_probability(
-            contract_label
-        ),
-        "estimated_probability": posterior[
-            "estimated_probability"
-        ],
+        "baseline_probability": baseline,
+        "estimated_probability": posterior["estimated_probability"],
         "lower_95": posterior["lower_95"],
         "upper_95": posterior["upper_95"],
         "warning": (
-            "Past digit frequencies do not guarantee future outcomes. "
-            "Validate on unseen data and use actual contract payouts."
+            "Past frequencies do not guarantee future outcomes. "
+            "Test on unseen data and verify actual contract payouts."
         ),
     }
 
@@ -260,14 +271,22 @@ def directional_features(
     short_window: int = 5,
     long_window: int = 20,
 ) -> Dict[str, Any]:
-    """Calculate basic moving-average and momentum features."""
-    if short_window < 1 or long_window < 2:
-        raise ValueError("Moving-average windows must be positive")
-
-    if short_window >= long_window:
-        raise ValueError("short_window must be smaller than long_window")
+    """Calculate moving averages and a simple momentum indicator."""
+    if (
+        not isinstance(short_window, int)
+        or not isinstance(long_window, int)
+        or short_window < 1
+        or long_window < 2
+        or short_window >= long_window
+    ):
+        raise ValueError(
+            "Use positive windows with short_window < long_window"
+        )
 
     values = [float(price) for price in prices]
+
+    if not all(isfinite(value) for value in values):
+        raise ValueError("Prices must be finite numbers")
 
     if len(values) < long_window:
         return {
@@ -276,7 +295,7 @@ def directional_features(
             "long_average": None,
             "momentum": None,
             "signal": "WAIT",
-            "warning": "Not enough prices for the requested windows.",
+            "warning": "Not enough prices for the selected windows.",
         }
 
     short_average = mean(values[-short_window:])
@@ -297,8 +316,8 @@ def directional_features(
         "momentum": momentum,
         "signal": signal,
         "warning": (
-            "This is a basic indicator, not a validated prediction "
-            "or a standalone reason to place a trade."
+            "This indicator is not a validated prediction and "
+            "must not be used alone to authorise a trade."
         ),
     }
 
@@ -309,27 +328,19 @@ def rank_opportunity(
     sample_size: int,
     minimum_sample: int = 100,
 ) -> Dict[str, Any]:
-    """
-    Screen a candidate using estimated probability and actual payout.
+    """Screen a candidate; never authorise a trade automatically."""
+    if not isinstance(sample_size, int) or sample_size < 0:
+        raise ValueError("sample_size must be a non-negative integer")
 
-    A positive estimate alone is insufficient to authorise a trade.
-    """
-    if not 0 <= probability <= 1:
-        raise ValueError("probability must be between 0 and 1")
-
-    if payout_multiple < 0:
-        raise ValueError("payout_multiple cannot be negative")
-
-    if sample_size < 0 or minimum_sample < 1:
-        raise ValueError("Invalid sample-size setting")
+    if not isinstance(minimum_sample, int) or minimum_sample < 1:
+        raise ValueError("minimum_sample must be a positive integer")
 
     ev = expected_value_per_stake(
         probability,
         payout_multiple,
     )
 
-    validated_sample = sample_size >= minimum_sample
-    candidate = validated_sample and ev > 0
+    sample_ok = sample_size >= minimum_sample
 
     return {
         "estimated_probability": probability,
@@ -337,12 +348,11 @@ def rank_opportunity(
         "expected_value_per_stake": ev,
         "sample_size": sample_size,
         "minimum_sample": minimum_sample,
-        "sample_requirement_met": validated_sample,
-        "candidate_for_further_testing": candidate,
+        "sample_requirement_met": sample_ok,
+        "candidate_for_further_testing": sample_ok and ev > 0,
         "trade_authorised": False,
         "warning": (
-            "This screening result does not authorise a trade. "
-            "Out-of-sample testing, payout verification, and risk "
-            "checks are still required."
+            "Further out-of-sample testing, payout verification, "
+            "and risk checks are required before any trade."
         ),
     }
