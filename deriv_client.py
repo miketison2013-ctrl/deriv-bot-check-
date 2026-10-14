@@ -1,9 +1,11 @@
 import json
+import math
 import requests
 import websocket
 
 
 API_BASE = "https://api.derivws.com"
+
 PUBLIC_WS = (
     "wss://api.derivws.com/"
     "trading/v1/options/ws/public"
@@ -56,9 +58,7 @@ class DerivClient:
                 )
 
                 if response.status_code == 401:
-                    message = (
-                        "Authentication failed. Check your token."
-                    )
+                    message = "Authentication failed. Check your token."
                 elif response.status_code == 403:
                     message = (
                         "Access denied. Check your token permissions "
@@ -156,8 +156,7 @@ class DerivClient:
     def _get_ws_url(self, account_id):
         result = self._rest(
             "POST",
-            f"/trading/v1/options/accounts/"
-            f"{account_id}/otp",
+            f"/trading/v1/options/accounts/{account_id}/otp",
         )
 
         url = result.get("url") if isinstance(result, dict) else None
@@ -377,10 +376,280 @@ class DerivClient:
             "DIGITDIFF": "Differs",
             "DIGITEVEN": "Even",
             "DIGITODD": "Odd",
+            "CALL": "Rise",
+            "PUT": "Fall",
         }
 
         return {
             labels[item["contract_type"]]: item["contract_type"]
             for item in available
             if item.get("contract_type") in labels
+        }
+
+    def get_proposal(
+        self,
+        account_type,
+        symbol,
+        contract_type,
+        amount,
+        currency,
+        duration=1,
+        duration_unit="t",
+        barrier=None,
+    ):
+        """Request a real proposal; this does not buy a contract."""
+        try:
+            amount = float(amount)
+            duration = int(duration)
+        except (TypeError, ValueError):
+            raise DerivAPIError(
+                "Stake and duration must be valid numbers."
+            )
+
+        if not math.isfinite(amount) or amount <= 0:
+            raise DerivAPIError(
+                "Stake must be greater than zero."
+            )
+
+        if duration < 1:
+            raise DerivAPIError(
+                "Duration must be at least one."
+            )
+
+        allowed = {
+            "DIGITOVER",
+            "DIGITUNDER",
+            "DIGITMATCH",
+            "DIGITDIFF",
+            "DIGITEVEN",
+            "DIGITODD",
+            "CALL",
+            "PUT",
+        }
+
+        if contract_type not in allowed:
+            raise DerivAPIError(
+                "Unsupported contract type."
+            )
+
+        if duration_unit not in ("t", "s", "m"):
+            raise DerivAPIError(
+                "Duration unit must be t, s or m."
+            )
+
+        digit_types = {
+            "DIGITOVER",
+            "DIGITUNDER",
+            "DIGITMATCH",
+            "DIGITDIFF",
+        }
+
+        if contract_type in digit_types:
+            if barrier is None:
+                raise DerivAPIError(
+                    "This digit contract requires a barrier from 0 to 9."
+                )
+
+            try:
+                barrier = int(barrier)
+            except (TypeError, ValueError):
+                raise DerivAPIError(
+                    "Barrier must be a digit from 0 to 9."
+                )
+
+            if barrier not in range(10):
+                raise DerivAPIError(
+                    "Barrier must be a digit from 0 to 9."
+                )
+        else:
+            barrier = None
+
+        account, ws = self._open_account(account_type)
+
+        payload = {
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": currency,
+            "duration": duration,
+            "duration_unit": duration_unit,
+            "underlying_symbol": symbol,
+            "req_id": 101,
+        }
+
+        if barrier is not None:
+            payload["barrier"] = str(barrier)
+
+        try:
+            response = self._request(ws, payload)
+        finally:
+            ws.close()
+
+        proposal = response.get("proposal")
+
+        if not isinstance(proposal, dict) or not proposal.get("id"):
+            raise DerivAPIError(
+                "Deriv did not return a valid proposal."
+            )
+
+        return {
+            "account_id": account["account_id"],
+            "account_type": account_type,
+            "symbol": symbol,
+            "contract_type": contract_type,
+            "stake": amount,
+            "currency": currency,
+            "proposal_id": proposal["id"],
+            "ask_price": float(proposal.get("ask_price", amount)),
+            "payout": float(proposal.get("payout", 0)),
+            "spot": proposal.get("spot"),
+            "barrier": barrier,
+            "raw": response,
+        }
+
+    def buy_contract(
+        self,
+        account_type,
+        proposal_id,
+        maximum_price,
+    ):
+        """Buy a contract from a proposal after explicit user approval."""
+        try:
+            maximum_price = float(maximum_price)
+        except (TypeError, ValueError):
+            raise DerivAPIError(
+                "Maximum purchase price must be a number."
+            )
+
+        if (
+            not math.isfinite(maximum_price)
+            or maximum_price <= 0
+        ):
+            raise DerivAPIError(
+                "Maximum purchase price must be positive."
+            )
+
+        if not proposal_id:
+            raise DerivAPIError(
+                "A valid proposal ID is required."
+            )
+
+        account, ws = self._open_account(account_type)
+
+        try:
+            response = self._request(
+                ws,
+                {
+                    "buy": str(proposal_id),
+                    "price": maximum_price,
+                    "req_id": 102,
+                },
+            )
+        finally:
+            ws.close()
+
+        bought = response.get("buy")
+
+        if (
+            not isinstance(bought, dict)
+            or not bought.get("contract_id")
+        ):
+            raise DerivAPIError(
+                "Deriv did not confirm a contract purchase."
+            )
+
+        return {
+            **bought,
+            "account_id": account["account_id"],
+            "account_type": account_type,
+            "raw": response,
+        }
+
+    def get_open_contract(self, account_type, contract_id):
+        """Fetch the latest status of an actual Deriv contract."""
+        try:
+            contract_id = int(contract_id)
+        except (TypeError, ValueError):
+            raise DerivAPIError(
+                "Contract ID must be a valid number."
+            )
+
+        account, ws = self._open_account(account_type)
+
+        try:
+            response = self._request(
+                ws,
+                {
+                    "proposal_open_contract": 1,
+                    "contract_id": contract_id,
+                    "req_id": 103,
+                },
+            )
+        finally:
+            ws.close()
+
+        contract = response.get("proposal_open_contract")
+
+        if not isinstance(contract, dict):
+            raise DerivAPIError(
+                "Deriv did not return contract details."
+            )
+
+        return {
+            **contract,
+            "account_id": account["account_id"],
+            "account_type": account_type,
+        }
+
+    def sell_contract(
+        self,
+        account_type,
+        contract_id,
+        price=0,
+    ):
+        """Ask Deriv to sell an open contract at the offered price."""
+        try:
+            contract_id = int(contract_id)
+            price = float(price)
+        except (TypeError, ValueError):
+            raise DerivAPIError(
+                "Contract ID and sale price must be valid numbers."
+            )
+
+        if (
+            contract_id <= 0
+            or not math.isfinite(price)
+            or price < 0
+        ):
+            raise DerivAPIError(
+                "Invalid contract ID or sale price."
+            )
+
+        account, ws = self._open_account(account_type)
+
+        try:
+            response = self._request(
+                ws,
+                {
+                    "sell": contract_id,
+                    "price": price,
+                    "req_id": 104,
+                },
+            )
+        finally:
+            ws.close()
+
+        sold = response.get("sell")
+
+        if not isinstance(sold, dict):
+            raise DerivAPIError(
+                "Deriv did not confirm the sale. "
+                "The contract may no longer be sellable."
+            )
+
+        return {
+            **sold,
+            "account_id": account["account_id"],
+            "account_type": account_type,
         }
