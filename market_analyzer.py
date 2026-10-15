@@ -1,11 +1,8 @@
-"""
-Market analysis module for the Deriv adaptive trading bot.
 
-Calculates descriptive statistics from actual tick prices.
-It does not place trades or guarantee future outcomes.
-"""
+"""Statistical analysis for Deriv tick markets."""
 
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from math import isfinite, sqrt
 from statistics import mean
 
@@ -13,59 +10,75 @@ from statistics import mean
 DIGITS = list(range(10))
 
 
-def _valid_prices(prices):
-    """Return finite numeric prices only."""
+def _price_texts(prices):
+    """Keep original price text for digit extraction."""
     result = []
 
     for price in prices or []:
+        text = str(price).strip()
+
         try:
-            value = float(price)
-        except (TypeError, ValueError):
+            value = Decimal(text)
+        except (InvalidOperation, ValueError):
             continue
 
-        if isfinite(value) and value > 0:
-            result.append(value)
+        if value.is_finite() and value > 0:
+            result.append(text)
 
     return result
 
 
-def _last_digit(price):
-    """
-    Extract the final displayed decimal digit.
+def _numeric_prices(prices):
+    """Convert valid prices to floats for movement calculations."""
+    values = []
 
-    Note: accurate digit analysis depends on receiving prices
-    with their original Deriv decimal precision.
-    """
+    for text in _price_texts(prices):
+        try:
+            value = float(Decimal(text))
+        except (ValueError, OverflowError):
+            continue
+
+        if isfinite(value) and value > 0:
+            values.append(value)
+
+    return values
+
+
+def _last_digit(price):
+    """Extract the final displayed decimal digit."""
     text = str(price).strip()
 
-    if "e" in text.lower():
-        text = format(float(text), "f")
-
-    if "." not in text:
-        return int(text[-1]) if text else None
-
-    decimals = text.split(".", 1)[1]
-    decimals = "".join(
-        character for character in decimals
-        if character.isdigit()
-    )
-
-    if not decimals:
+    try:
+        value = Decimal(text)
+    except (InvalidOperation, ValueError):
         return None
 
-    return int(decimals[-1])
+    if not value.is_finite() or value <= 0:
+        return None
+
+    # Convert scientific notation to ordinary decimal notation.
+    if "e" in text.lower():
+        text = format(value, "f")
+
+    if "." not in text:
+        digits = "".join(c for c in text if c.isdigit())
+        return int(digits[-1]) if digits else None
+
+    decimals = text.split(".", 1)[1]
+    decimals = "".join(c for c in decimals if c.isdigit())
+
+    return int(decimals[-1]) if decimals else None
 
 
 def digit_statistics(prices, window=100):
-    """Calculate rolling last-digit frequencies and percentages."""
-    prices = _valid_prices(prices)
-    prices = prices[-max(1, int(window)):]
+    """Calculate last-digit counts and percentages."""
+    texts = _price_texts(prices)
+    texts = texts[-max(1, int(window)):]
 
     digits = [
         _last_digit(price)
-        for price in prices
+        for price in texts
     ]
-
     digits = [
         digit for digit in digits
         if digit is not None and 0 <= digit <= 9
@@ -78,16 +91,12 @@ def digit_statistics(prices, window=100):
 
     for digit in DIGITS:
         count = counts.get(digit, 0)
-        percentage = (
-            count / sample_size * 100
-            if sample_size
-            else 0.0
-        )
-
         rows.append({
             "digit": digit,
             "count": count,
-            "percentage": round(percentage, 2),
+            "percentage": round(
+                count / sample_size * 100, 2
+            ) if sample_size else 0.0,
             "sample_size": sample_size,
         })
 
@@ -104,24 +113,20 @@ def digit_statistics(prices, window=100):
         "sample_size": sample_size,
         "counts": rows,
         "ranked_digits": ranked,
-        "most_frequent": (
-            ranked[0]["digit"] if sample_size else None
-        ),
-        "least_frequent": (
-            ranked[-1]["digit"] if sample_size else None
-        ),
+        "most_frequent": ranked[0]["digit"] if sample_size else None,
+        "least_frequent": ranked[-1]["digit"] if sample_size else None,
     }
 
 
 def price_statistics(prices):
     """Calculate descriptive price movement statistics."""
-    prices = _valid_prices(prices)
+    values = _numeric_prices(prices)
 
-    if len(prices) < 2:
+    if len(values) < 2:
         return {
-            "sample_size": len(prices),
-            "first_price": prices[0] if prices else None,
-            "latest_price": prices[-1] if prices else None,
+            "sample_size": len(values),
+            "first_price": values[0] if values else None,
+            "latest_price": values[-1] if values else None,
             "change": None,
             "change_percent": None,
             "direction": "INSUFFICIENT DATA",
@@ -130,30 +135,19 @@ def price_statistics(prices):
         }
 
     changes = [
-        prices[index] - prices[index - 1]
-        for index in range(1, len(prices))
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
     ]
 
-    absolute_changes = [abs(change) for change in changes]
-
-    average_absolute_change = mean(absolute_changes)
-
     average_change = mean(changes)
-
     variance = mean([
         (change - average_change) ** 2
         for change in changes
     ])
 
-    first_price = prices[0]
-    latest_price = prices[-1]
+    first_price = values[0]
+    latest_price = values[-1]
     total_change = latest_price - first_price
-
-    change_percent = (
-        total_change / first_price * 100
-        if first_price
-        else None
-    )
 
     if total_change > 0:
         direction = "UP"
@@ -163,34 +157,39 @@ def price_statistics(prices):
         direction = "FLAT"
 
     return {
-        "sample_size": len(prices),
+        "sample_size": len(values),
         "first_price": first_price,
         "latest_price": latest_price,
         "change": total_change,
-        "change_percent": change_percent,
+        "change_percent": (
+            total_change / first_price * 100
+            if first_price else None
+        ),
         "direction": direction,
-        "mean_absolute_tick_change": average_absolute_change,
+        "mean_absolute_tick_change": mean(
+            abs(change) for change in changes
+        ),
         "tick_change_stddev": sqrt(variance),
     }
 
 
 def momentum_statistics(prices, short_window=10, long_window=30):
-    """Compare short and long average prices."""
-    prices = _valid_prices(prices)
+    """Compare short and long moving averages."""
+    values = _numeric_prices(prices)
 
     short_window = max(2, int(short_window))
     long_window = max(short_window, int(long_window))
 
-    if len(prices) < long_window:
+    if len(values) < long_window:
         return {
             "signal": "INSUFFICIENT DATA",
             "short_average": None,
             "long_average": None,
-            "sample_size": len(prices),
+            "sample_size": len(values),
         }
 
-    short_average = mean(prices[-short_window:])
-    long_average = mean(prices[-long_window:])
+    short_average = mean(values[-short_window:])
+    long_average = mean(values[-long_window:])
 
     if short_average > long_average:
         signal = "UPWARD MOMENTUM"
@@ -203,40 +202,33 @@ def momentum_statistics(prices, short_window=10, long_window=30):
         "signal": signal,
         "short_average": short_average,
         "long_average": long_average,
-        "sample_size": len(prices),
+        "sample_size": len(values),
     }
 
 
 def analyse_market(prices, symbol="UNKNOWN", window=100):
     """Combine digit, price movement and momentum statistics."""
-    prices = _valid_prices(prices)
+    texts = _price_texts(prices)
+    window = max(1, int(window))
+    selected = texts[-window:]
 
     return {
         "symbol": str(symbol),
-        "price": price_statistics(prices),
-        "digits": digit_statistics(prices, window=window),
-        "momentum": momentum_statistics(prices),
-        "analysis_window": min(len(prices), max(1, int(window))),
+        "price": price_statistics(selected),
+        "digits": digit_statistics(selected, window=window),
+        "momentum": momentum_statistics(selected),
+        "analysis_window": len(selected),
     }
 
 
 def rank_markets(market_analyses):
-    """
-    Rank markets by observed absolute price movement.
-
-    This is a descriptive volatility ranking, not a trade signal.
-    Markets with insufficient data are placed last.
-    """
+    """Rank markets by observed absolute tick movement."""
     analyses = list(market_analyses or [])
 
     def ranking_key(item):
-        price_data = item.get("price", {})
-        movement = price_data.get(
-            "mean_absolute_tick_change"
-        )
-
-        if movement is None:
-            return (0, 0.0)
+        movement = item.get(
+            "price", {}
+        ).get("mean_absolute_tick_change")
 
         try:
             movement = float(movement)
@@ -256,7 +248,7 @@ def rank_markets(market_analyses):
 
 
 def rank_digits_across_markets(market_analyses):
-    """Summarize each digit's frequency across analysed markets."""
+    """Aggregate observed digit frequencies across markets."""
     totals = {
         digit: {
             "digit": digit,
@@ -268,34 +260,29 @@ def rank_digits_across_markets(market_analyses):
     }
 
     for analysis in market_analyses or []:
-        digit_data = analysis.get("digits", {})
-        rows = digit_data.get("counts", [])
+        rows = analysis.get("digits", {}).get("counts", [])
 
         for row in rows:
             digit = row.get("digit")
-
             if digit not in totals:
                 continue
 
             count = int(row.get("count", 0))
-            sample_size = int(row.get("sample_size", 0))
+            samples = int(row.get("sample_size", 0))
 
             totals[digit]["total_count"] += count
-            totals[digit]["total_samples"] += sample_size
+            totals[digit]["total_samples"] += samples
 
-            if sample_size > 0:
+            if samples > 0:
                 totals[digit]["markets_observed"] += 1
 
     results = []
 
-    for digit, item in totals.items():
+    for item in totals.values():
         samples = item["total_samples"]
-
         item["percentage"] = round(
-            item["total_count"] / samples * 100,
-            2,
+            item["total_count"] / samples * 100, 2
         ) if samples else 0.0
-
         results.append(item)
 
     return sorted(
