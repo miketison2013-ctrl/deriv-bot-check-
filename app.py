@@ -1,6 +1,7 @@
+import time
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
 from deriv_client import DerivClient
 from trade_journal import TradeJournal
@@ -8,13 +9,13 @@ from trading_engine import TradingEngine
 
 
 st.set_page_config(
-    page_title="Deriv Volatility Digit Bot",
+    page_title="Deriv Digit Bot",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("📊 Deriv Volatility Digit Bot")
-st.caption("Digit contracts · Market scanner · Risk controls · Trade journal")
+st.title("Deriv Volatility Digit Bot")
+st.caption("Automatic digit-market scanning · Ranking · Risk controls")
 
 DEFAULTS = {
     "client": None,
@@ -22,14 +23,17 @@ DEFAULTS = {
     "journal": None,
     "connected_account": None,
     "balance": {},
-    "account_balances": {},
     "connection_error": "",
     "connection_message": "",
     "last_scan_result": None,
     "last_cycle_result": None,
-    "digit_config": {
-        "stake": 1.0,
-        "max_stake": 1.0,
+    "session_start_pl": 0.0,
+    "session_tp": 5.0,
+    "session_sl": 5.0,
+    "session_limits": {},
+    "config": {
+        "stake": 0.35,
+        "max_stake": 0.35,
         "duration": 1,
         "duration_unit": "t",
         "daily_loss_limit": 5.0,
@@ -41,25 +45,15 @@ DEFAULTS = {
 
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
-        st.session_state[key] = value.copy() if isinstance(value, dict) else value
+        st.session_state[key] = (
+            value.copy() if isinstance(value, dict) else value
+        )
 
 
-def stop_engine():
-    engine = st.session_state.get("engine")
+def stop_bot():
+    engine = st.session_state.engine
     if engine is not None:
         engine.running = False
-
-
-def reset_connection():
-    stop_engine()
-    st.session_state.client = None
-    st.session_state.engine = None
-    st.session_state.journal = None
-    st.session_state.connected_account = None
-    st.session_state.balance = {}
-    st.session_state.account_balances = {}
-    st.session_state.last_scan_result = None
-    st.session_state.last_cycle_result = None
 
 
 def money(value, currency=""):
@@ -69,12 +63,31 @@ def money(value, currency=""):
         return f"Unavailable {currency}".strip()
 
 
-def show_error(prefix, exc):
-    st.error(f"{prefix}: {exc}")
+def reset_connection():
+    stop_bot()
+    st.session_state.client = None
+    st.session_state.engine = None
+    st.session_state.journal = None
+    st.session_state.connected_account = None
+    st.session_state.balance = {}
+    st.session_state.last_scan_result = None
+    st.session_state.last_cycle_result = None
+
+
+def session_net_pl(account_type):
+    """Calculate realised P/L since the current session started."""
+    journal = st.session_state.journal
+    if journal is None:
+        return 0.0
+
+    summary = journal.summary(account_type=account_type)
+    current = float(summary.get("total_profit_loss", 0.0) or 0.0)
+    baseline = st.session_state.session_start_pl
+    return current - baseline
 
 
 # --------------------------------------------------
-# SIDEBAR: CONNECTION
+# CONNECTION
 # --------------------------------------------------
 
 st.sidebar.header("Deriv connection")
@@ -82,18 +95,16 @@ st.sidebar.header("Deriv connection")
 app_id = st.sidebar.text_input(
     "App ID",
     key="app_id_input",
-    help="Enter your Deriv application ID.",
 )
 
 token = st.sidebar.text_input(
-    "Personal Access Token",
+    "API token",
     type="password",
     key="token_input",
-    help="Never share or commit your token.",
 )
 
 account_type = st.sidebar.radio(
-    "Account used for trading",
+    "Trading account",
     ["demo", "real"],
     format_func=lambda x: "Demo account" if x == "demo" else "REAL account",
     key="account_type_input",
@@ -102,8 +113,7 @@ account_type = st.sidebar.radio(
 real_confirm = False
 if account_type == "real":
     real_confirm = st.sidebar.checkbox(
-        "I understand real-money trades can lose money.",
-        key="real_trading_confirmation",
+        "I understand that real-money trades can lose money."
     )
 
 if (
@@ -112,23 +122,24 @@ if (
 ):
     reset_connection()
     st.session_state.connection_message = (
-        "Account selection changed. Connect again to the selected account."
+        "Account selection changed. Connect to the selected account again."
     )
 
-if st.sidebar.button("Connect / reconnect", type="primary", use_container_width=True):
+if st.sidebar.button("Connect / reconnect", use_container_width=True):
     if not app_id.strip() or not token.strip():
-        st.session_state.connection_error = "Enter both App ID and token."
+        st.session_state.connection_error = "Enter your App ID and API token."
     elif account_type == "real" and not real_confirm:
-        st.session_state.connection_error = "Confirm the Real-account risk warning."
+        st.session_state.connection_error = (
+            "Confirm the Real-account risk warning first."
+        )
     else:
         try:
-            # Constructor order: API token first, App ID second.
             client = DerivClient(
                 api_token=token.strip(),
                 app_id=app_id.strip(),
             )
 
-            with st.spinner("Checking selected Deriv account..."):
+            with st.spinner("Connecting to Deriv..."):
                 balance = client.get_balance(account_type)
 
             journal = TradeJournal("trade_journal.db")
@@ -139,15 +150,19 @@ if st.sidebar.button("Connect / reconnect", type="primary", use_container_width=
             st.session_state.journal = journal
             st.session_state.connected_account = account_type
             st.session_state.balance = balance
-            st.session_state.account_balances = {
-                account_type: balance,
-            }
             st.session_state.last_scan_result = None
             st.session_state.last_cycle_result = None
             st.session_state.connection_error = ""
             st.session_state.connection_message = (
-                f"Connected to {account_type.upper()} account."
+                f"Connected to {account_type.upper()}."
             )
+
+            summary = journal.summary(account_type=account_type)
+            st.session_state.session_start_pl = float(
+                summary.get("total_profit_loss", 0.0) or 0.0
+            )
+            st.session_state.session_limits = {}
+
             st.rerun()
 
         except Exception as exc:
@@ -159,494 +174,386 @@ if st.session_state.connection_error:
 if st.session_state.connection_message:
     st.sidebar.success(st.session_state.connection_message)
 
-st.sidebar.caption(
-    "Your token stays in the password field. Do not put it in GitHub code."
-)
-
-connected = (
-    st.session_state.client is not None
-    and st.session_state.engine is not None
-    and st.session_state.journal is not None
-    and st.session_state.connected_account == account_type
-)
-
-if not connected:
-    st.warning("Connect to your selected account to load balances and market data.")
-    st.info(
-        "The bot focuses on digit contracts: Over, Under, Matches, "
-        "Differs, Even and Odd, where supported."
-    )
+if st.session_state.client is None:
+    st.info("Connect to your selected Deriv account to continue.")
     st.stop()
 
 client = st.session_state.client
 engine = st.session_state.engine
 journal = st.session_state.journal
+balance = st.session_state.balance or {}
+currency = balance.get("currency", "")
 
+if st.session_state.connected_account != account_type:
+    st.warning("Reconnect to the currently selected account.")
+    st.stop()
+
+if account_type == "real":
+    st.error("REAL ACCOUNT SELECTED — real-money losses are possible.")
 
 # --------------------------------------------------
-# ACCOUNT BALANCES
+# ACCOUNT OVERVIEW
 # --------------------------------------------------
 
 st.header("Account overview")
 
-if account_type == "real":
-    st.warning("REAL ACCOUNT SELECTED — real-money losses are possible.")
+left, middle, right = st.columns(3)
+left.metric("Selected account", account_type.upper())
+middle.metric("Balance", money(balance.get("balance"), currency))
+right.metric("Account ID", str(balance.get("account_id", "Unavailable")))
 
-balance_col, refresh_col = st.columns([3, 1])
-
-with refresh_col:
-    if st.button("Refresh selected balance", use_container_width=True):
-        try:
-            new_balance = client.get_balance(account_type)
-            st.session_state.balance = new_balance
-            st.session_state.account_balances[account_type] = new_balance
-            st.rerun()
-        except Exception as exc:
-            show_error("Balance refresh failed", exc)
-
-balance = st.session_state.balance or {}
-currency = balance.get("currency", "")
-
-with balance_col:
-    a, b, c = st.columns(3)
-    a.metric("Selected account", account_type.upper())
-    b.metric("Balance", money(balance.get("balance"), currency))
-    c.metric(
-        "Account ID",
-        str(balance.get("account_id", "Unavailable")),
-    )
-
-with st.expander("Check Demo and Real balances"):
-    st.caption(
-        "Each balance request uses the token currently entered. "
-        "The token must have access to the account being checked."
-    )
-
-    demo_col, real_col = st.columns(2)
-
-    with demo_col:
-        if st.button("Load Demo balance", use_container_width=True):
-            try:
-                result = client.get_balance("demo")
-                st.session_state.account_balances["demo"] = result
-            except Exception as exc:
-                show_error("Demo balance failed", exc)
-
-        demo_balance = st.session_state.account_balances.get("demo")
-        if demo_balance:
-            st.metric(
-                "Demo balance",
-                money(
-                    demo_balance.get("balance"),
-                    demo_balance.get("currency", ""),
-                ),
-            )
-            st.caption(
-                f"Account ID: {demo_balance.get('account_id', 'Unavailable')}"
-            )
-
-    with real_col:
-        if st.button("Load Real balance", use_container_width=True):
-            try:
-                result = client.get_balance("real")
-                st.session_state.account_balances["real"] = result
-            except Exception as exc:
-                show_error("Real balance failed", exc)
-
-        real_balance = st.session_state.account_balances.get("real")
-        if real_balance:
-            st.metric(
-                "Real balance",
-                money(
-                    real_balance.get("balance"),
-                    real_balance.get("currency", ""),
-                ),
-            )
-            st.caption(
-                f"Account ID: {real_balance.get('account_id', 'Unavailable')}"
-            )
-
-st.divider()
-
-
-# --------------------------------------------------
-# MARKET SCANNER
-# --------------------------------------------------
-
-st.header("Volatility digit market scanner")
-st.write(
-    "Scan available Volatility markets, recent prices, digit frequencies "
-    "and supported digit contracts. Scanning does not place a trade."
-)
-
-scan_col, scan_help_col = st.columns([1, 3])
-
-with scan_col:
-    scan_clicked = st.button(
-        "🔎 Scan markets",
-        type="primary",
-        use_container_width=True,
-    )
-
-with scan_help_col:
-    st.caption(
-        "A scan requests recent ticks and checks available digit contracts. "
-        "It may take time depending on the number of markets."
-    )
-
-scan_config = {
-    "tick_sample_size": 150,
-    "minimum_digit_samples": 80,
-    "max_scan_markets": 40,
-}
-
-if scan_clicked:
+if st.button("Refresh selected balance"):
     try:
-        with st.spinner("Scanning Volatility markets..."):
-            st.session_state.last_scan_result = engine.scan_markets(scan_config)
-        st.session_state.last_cycle_result = None
+        st.session_state.balance = client.get_balance(account_type)
+        st.rerun()
     except Exception as exc:
-        show_error("Market scan failed", exc)
+        st.error(f"Balance refresh failed: {exc}")
 
-scan_result = st.session_state.last_scan_result
-
-if scan_result:
-    st.caption(
-        f"Scan time: {scan_result.get('scan_time', 'Unknown')} · "
-        f"Markets analysed: {scan_result.get('markets_analysed', 0)} · "
-        f"Candidate setups: {scan_result.get('candidate_count', 0)}"
-    )
-
-    market_rows = scan_result.get("results", [])
-
-    if market_rows:
-        market_frame = pd.DataFrame([
-            {
-                "Rank": index + 1,
-                "Market": market.get(
-                    "display_name", market.get("symbol", "")
-                ),
-                "Symbol": market.get("symbol"),
-                "Latest price": market.get("latest_price"),
-                "Samples": market.get("sample_size"),
-                "Momentum": market.get("momentum"),
-                "Supported digit contracts": ", ".join(
-                    market.get("supported_digit_contracts", [])
-                ),
-            }
-            for index, market in enumerate(market_rows)
-        ])
-
-        st.subheader("Ranked scan results")
-        st.dataframe(
-            market_frame,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        symbols = [
-            market.get("symbol")
-            for market in market_rows
-            if market.get("symbol")
-        ]
-
-        if symbols:
-            selected_symbol = st.selectbox(
-                "Inspect last-digit frequencies",
-                symbols,
-                format_func=lambda symbol: next(
-                    (
-                        f"{market.get('display_name', symbol)} ({symbol})"
-                        for market in market_rows
-                        if market.get("symbol") == symbol
-                    ),
-                    symbol,
-                ),
+with st.expander("Check other account balance"):
+    other_account = "real" if account_type == "demo" else "demo"
+    if st.button(f"Load {other_account.upper()} balance"):
+        try:
+            other_balance = client.get_balance(other_account)
+            st.write(
+                f"{other_account.upper()}: "
+                f"{money(other_balance.get('balance'), other_balance.get('currency', ''))}"
             )
-
-            selected_market = next(
-                (
-                    market for market in market_rows
-                    if market.get("symbol") == selected_symbol
-                ),
-                {},
+            st.caption(
+                f"Account ID: {other_balance.get('account_id', 'Unavailable')}"
             )
-
-            digit_rows = selected_market.get("digit_counts", [])
-            if digit_rows:
-                st.dataframe(
-                    pd.DataFrame(digit_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.info("No digit-frequency data for this market.")
-
-    candidate_rows = scan_result.get("candidates", [])
-
-    st.subheader("Candidate digit setups")
-    if candidate_rows:
-        candidate_frame = pd.DataFrame([
-            {
-                "Market": row.get("symbol"),
-                "Setup": row.get("description"),
-                "Contract type": row.get("contract_type"),
-                "Barrier": row.get("barrier"),
-                "Observed frequency": row.get("observed_probability"),
-                "Samples": row.get("sample_size"),
-            }
-            for row in candidate_rows[:100]
-        ])
-        st.dataframe(
-            candidate_frame,
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No eligible candidate setups were returned.")
-
-    errors = scan_result.get("errors", {})
-    if errors:
-        with st.expander(f"Scan errors ({len(errors)})"):
-            st.json(errors)
-
-    st.caption(
-        "Historical frequencies are not guarantees of future outcomes "
-        "and do not establish that a setup is profitable."
-    )
-else:
-    st.info("Scan markets to view current analysis.")
+        except Exception as exc:
+            st.error(f"Could not load {other_account} balance: {exc}")
 
 st.divider()
 
-
 # --------------------------------------------------
-# SETTINGS
+# TRADE SETTINGS
 # --------------------------------------------------
 
-st.header("Trading settings")
+st.header("Trade settings")
 
-with st.form("digit_settings"):
-    left, right = st.columns(2)
+cfg = st.session_state.config
 
-    with left:
+with st.form("trade_settings"):
+    col1, col2 = st.columns(2)
+
+    with col1:
         stake = st.number_input(
             "Stake per trade",
             min_value=0.35,
-            value=float(st.session_state.digit_config["stake"]),
-            step=0.25,
-            format="%.2f",
+            value=float(cfg["stake"]),
+            step=0.05,
         )
-        max_price = st.number_input(
+        max_stake = st.number_input(
             "Maximum purchase price",
             min_value=0.35,
-            value=float(st.session_state.digit_config["max_stake"]),
-            step=0.25,
-            format="%.2f",
+            value=float(cfg["max_stake"]),
+            step=0.05,
         )
         duration = st.number_input(
             "Contract duration",
             min_value=1,
-            value=int(st.session_state.digit_config["duration"]),
+            value=int(cfg["duration"]),
             step=1,
         )
         duration_unit = st.selectbox(
             "Duration unit",
             ["t", "s", "m"],
-            index=["t", "s", "m"].index(
-                st.session_state.digit_config["duration_unit"]
-                if st.session_state.digit_config["duration_unit"] in ("t", "s", "m")
-                else "t"
-            ),
-            format_func=lambda value: {
+            index=["t", "s", "m"].index(cfg["duration_unit"]),
+            format_func=lambda x: {
                 "t": "Ticks",
                 "s": "Seconds",
                 "m": "Minutes",
-            }[value],
+            }[x],
         )
 
-    with right:
+    with col2:
+        take_profit = st.number_input(
+            "Session Take Profit",
+            min_value=0.01,
+            value=float(st.session_state.session_tp),
+            step=0.5,
+            help="Stop opening new trades when session realised profit reaches this amount.",
+        )
+        stop_loss = st.number_input(
+            "Session Stop Loss",
+            min_value=0.01,
+            value=float(st.session_state.session_sl),
+            step=0.5,
+            help="Stop opening new trades when session realised loss reaches this amount.",
+        )
         daily_loss_limit = st.number_input(
             "Daily loss limit",
             min_value=0.35,
-            value=float(st.session_state.digit_config["daily_loss_limit"]),
+            value=float(cfg["daily_loss_limit"]),
             step=0.5,
-            format="%.2f",
         )
         max_open_trades = st.number_input(
             "Maximum open trades",
             min_value=1,
             max_value=10,
-            value=int(st.session_state.digit_config["max_open_trades"]),
+            value=int(cfg["max_open_trades"]),
             step=1,
         )
         cooldown_seconds = st.number_input(
             "Seconds between entries",
             min_value=0,
-            value=int(st.session_state.digit_config["cooldown_seconds"]),
+            value=int(cfg["cooldown_seconds"]),
             step=10,
         )
         loss_cooldown_seconds = st.number_input(
             "Pause after a loss (seconds)",
             min_value=0,
-            value=int(st.session_state.digit_config["loss_cooldown_seconds"]),
+            value=int(cfg["loss_cooldown_seconds"]),
             step=30,
         )
 
-    settings_saved = st.form_submit_button("Apply settings")
+    saved = st.form_submit_button("Save trade settings")
 
-if settings_saved:
-    st.session_state.digit_config = {
-        "stake": float(stake),
-        "max_stake": float(max_price),
-        "duration": int(duration),
-        "duration_unit": duration_unit,
-        "daily_loss_limit": float(daily_loss_limit),
-        "max_open_trades": int(max_open_trades),
-        "cooldown_seconds": int(cooldown_seconds),
-        "loss_cooldown_seconds": int(loss_cooldown_seconds),
-    }
-    st.success("Settings applied.")
+if saved:
+    if stake > max_stake:
+        st.error("Stake cannot exceed maximum purchase price.")
+    else:
+        st.session_state.config = {
+            "stake": float(stake),
+            "max_stake": float(max_stake),
+            "duration": int(duration),
+            "duration_unit": duration_unit,
+            "daily_loss_limit": float(daily_loss_limit),
+            "max_open_trades": int(max_open_trades),
+            "cooldown_seconds": int(cooldown_seconds),
+            "loss_cooldown_seconds": int(loss_cooldown_seconds),
+        }
+        st.session_state.session_tp = float(take_profit)
+        st.session_state.session_sl = float(stop_loss)
+        st.success("Trade settings saved.")
 
-settings = st.session_state.digit_config
-
+cfg = st.session_state.config
 st.caption(
-    f"Stake: {settings['stake']:.2f} {currency} · "
-    f"Max purchase price: {settings['max_stake']:.2f} {currency} · "
-    f"Duration: {settings['duration']} {settings['duration_unit']}"
+    f"Stake: {cfg['stake']:.2f} {currency} · "
+    f"TP: {st.session_state.session_tp:.2f} {currency} · "
+    f"SL: {st.session_state.session_sl:.2f} {currency}"
 )
 
 st.divider()
 
-
 # --------------------------------------------------
-# AUTOMATION
+# BOT CONTROLS
 # --------------------------------------------------
 
 st.header("Bot controls")
 
-if account_type == "real":
-    st.error(
-        "REAL ACCOUNT: only enable trading after successful Demo testing "
-        "and checking every risk setting."
-    )
+running = bool(engine.running)
 
-start_col, stop_col, cycle_col = st.columns(3)
+start_col, stop_col = st.columns(2)
 
 with start_col:
     start_clicked = st.button(
-        "▶ Start bot",
+        "▶ START BOT",
         type="primary",
+        disabled=running,
         use_container_width=True,
     )
 
 with stop_col:
     stop_clicked = st.button(
-        "■ Stop bot",
-        use_container_width=True,
-    )
-
-with cycle_col:
-    cycle_clicked = st.button(
-        "Run one cycle",
+        "■ STOP BOT",
+        disabled=not running,
         use_container_width=True,
     )
 
 if stop_clicked:
-    engine.running = False
+    stop_bot()
     st.session_state.connection_message = (
-        "Bot stopped. Already purchased contracts may remain open."
+        "Bot stopped. New trades will not be initiated. "
+        "Check open positions below; some contracts may remain open."
     )
     st.rerun()
 
 if start_clicked:
     if account_type == "real" and not real_confirm:
-        st.error("Confirm the Real-account warning first.")
-    elif not scan_result:
-        st.error("Scan markets before enabling the bot.")
-    elif settings["stake"] > settings["max_stake"]:
-        st.error("Stake cannot exceed maximum purchase price.")
-    elif settings["stake"] > float(balance.get("balance", 0)):
-        st.error("Stake exceeds the selected account balance.")
+        st.error("Confirm Real-account risk before starting.")
+    elif cfg["stake"] > float(balance.get("balance", 0)):
+        st.error("Stake exceeds the available account balance.")
     else:
         engine.running = True
         engine.last_error = ""
-        st.session_state.connection_message = (
-            "Bot enabled. Use Run one cycle to execute one engine cycle."
+        st.session_state.session_limits[account_type] = False
+        st.session_state.session_start_pl = float(
+            journal.summary(account_type=account_type).get(
+                "total_profit_loss", 0.0
+            ) or 0.0
         )
+        st.session_state.connection_message = "Bot started."
         st.rerun()
 
-if cycle_clicked:
-    if not engine.running:
-        st.warning("The bot is stopped. Start it before running a cycle.")
-    elif account_type == "real" and not real_confirm:
-        st.error("Real-account confirmation is required.")
-    elif settings["stake"] > settings["max_stake"]:
-        st.error("Stake cannot exceed maximum purchase price.")
-    else:
-        cycle_config = {
-            **settings,
-            "account_type": account_type,
-            "allow_real": account_type == "real" and real_confirm,
-            "currency": balance.get("currency"),
-            "tick_sample_size": 150,
-            "minimum_digit_samples": 80,
-            "max_scan_markets": 40,
-            "proposal_checks_per_cycle": 8,
-            "minimum_observed_probability": 0.0,
-            "minimum_estimated_edge": 0.02,
-        }
-        try:
-            with st.spinner("Running one engine cycle..."):
-                st.session_state.last_cycle_result = engine.run_cycle(
-                    cycle_config
-                )
-        except Exception as exc:
-            engine.running = False
-            engine.last_error = str(exc)
-            st.session_state.last_cycle_result = {"error": str(exc)}
+# --------------------------------------------------
+# CONTINUOUS TRADING CYCLE
+# --------------------------------------------------
 
-status_a, status_b, status_c = st.columns(3)
-status_a.metric(
-    "Bot status",
-    "RUNNING / ENABLED" if engine.running else "STOPPED",
-)
-status_b.metric("Trading account", account_type.upper())
+if engine.running:
+    try:
+        # Monitor settlements before checking session limits.
+        engine.monitor_open_trades(account_type)
+
+        net_pl = session_net_pl(account_type)
+        tp = float(st.session_state.session_tp)
+        sl = float(st.session_state.session_sl)
+
+        if net_pl >= tp:
+            engine.running = False
+            st.session_state.session_limits[account_type] = True
+            st.warning(
+                f"Take Profit reached ({money(net_pl, currency)}). "
+                "New trades stopped."
+            )
+
+        elif net_pl <= -sl:
+            engine.running = False
+            st.session_state.session_limits[account_type] = True
+            st.warning(
+                f"Stop Loss reached ({money(net_pl, currency)}). "
+                "New trades stopped."
+            )
+
+        elif account_type == "real" and not real_confirm:
+            engine.running = False
+            st.error("Real-account confirmation is missing. Bot stopped.")
+
+        else:
+            cycle_config = {
+                **cfg,
+                "account_type": account_type,
+                "allow_real": account_type == "real" and real_confirm,
+                "currency": currency,
+                "tick_sample_size": 150,
+                "minimum_digit_samples": 80,
+                "max_scan_markets": 40,
+                "proposal_checks_per_cycle": 8,
+                "minimum_observed_probability": 0.0,
+                "minimum_estimated_edge": 0.02,
+            }
+
+            with st.spinner("Scanning markets and checking ranked setups..."):
+                scan_result = engine.scan_markets(cycle_config)
+                st.session_state.last_scan_result = scan_result
+
+                # run_cycle scans internally too; this preserves its existing
+                # proposal, purchase, journal, and risk-check flow.
+                cycle_result = engine.run_cycle(cycle_config)
+                st.session_state.last_cycle_result = cycle_result
+
+    except Exception as exc:
+        engine.running = False
+        engine.last_error = str(exc)
+        st.error(f"Bot stopped because of an error: {exc}")
+
+if engine.running:
+    st.info(
+        "Bot is running. The page refreshes automatically to continue scanning. "
+        "Use STOP BOT to prevent further entries."
+    )
+    time.sleep(3)
+    st.rerun()
+
+# --------------------------------------------------
+# STATUS
+# --------------------------------------------------
+
+st.subheader("Bot status")
+
+status1, status2, status3 = st.columns(3)
+status1.metric("Status", "RUNNING" if engine.running else "STOPPED")
+status2.metric("Account", account_type.upper())
 
 try:
-    open_count = journal.summary(account_type=account_type).get(
-        "open_trades", 0
-    )
+    summary = journal.summary(account_type=account_type)
+    status3.metric("Open trades", summary.get("open_trades", 0))
 except Exception:
-    open_count = "Unavailable"
+    status3.metric("Open trades", "Unavailable")
 
-status_c.metric("Recorded open trades", open_count)
+try:
+    current_net = session_net_pl(account_type)
+    st.metric("Session realised P/L", money(current_net, currency))
+except Exception as exc:
+    st.warning(f"Could not calculate session P/L: {exc}")
 
-st.write("**Latest action:**", getattr(engine, "last_action", "Unavailable"))
-st.write("**Latest signal:**", getattr(engine, "last_signal", "Unavailable"))
+st.write("**Latest action:**", getattr(engine, "last_action", "Ready"))
+st.write("**Latest signal:**", getattr(engine, "last_signal", "WAIT"))
 
-last_error = getattr(engine, "last_error", "")
-if last_error:
-    st.error(last_error)
+if getattr(engine, "last_error", ""):
+    st.error(engine.last_error)
 
 cycle_result = st.session_state.last_cycle_result or {}
 if cycle_result.get("error"):
     st.error(cycle_result["error"])
 
-trade = cycle_result.get("trade")
-if isinstance(trade, dict) and trade.get("contract_id"):
-    st.success(
-        f"Engine reported contract ID: {trade['contract_id']}"
-    )
-
-st.info(
-    "This dashboard does not run a continuous background trading loop. "
-    "Start enables the engine; Run one cycle performs a single cycle. "
-    "Stop prevents further cycles initiated here."
-)
-
 st.divider()
 
+# --------------------------------------------------
+# MARKET SCAN RESULTS
+# --------------------------------------------------
+
+st.header("Market scanner")
+
+scan = st.session_state.last_scan_result
+
+if scan:
+    st.caption(
+        f"Markets analysed: {scan.get('markets_analysed', 0)} · "
+        f"Candidate setups: {scan.get('candidate_count', 0)} · "
+        f"Time: {scan.get('scan_time', 'Unknown')}"
+    )
+
+    rows = scan.get("results", [])
+    if rows:
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Market": item.get("display_name", item.get("symbol")),
+                    "Symbol": item.get("symbol"),
+                    "Latest price": item.get("latest_price"),
+                    "Samples": item.get("sample_size"),
+                    "Momentum": item.get("momentum"),
+                    "Contracts": ", ".join(
+                        item.get("supported_digit_contracts", [])
+                    ),
+                }
+                for item in rows
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.warning("No markets passed scanner validation.")
+
+    candidates = scan.get("candidates", [])
+    if candidates:
+        st.subheader("Ranked digit setups")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Market": item.get("symbol"),
+                    "Setup": item.get("description"),
+                    "Contract": item.get("contract_type"),
+                    "Barrier": item.get("barrier"),
+                    "Observed frequency": item.get("observed_probability"),
+                    "Samples": item.get("sample_size"),
+                }
+                for item in candidates[:100]
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    errors = scan.get("errors", {})
+    if errors:
+        with st.expander(f"Scanner errors ({len(errors)})"):
+            st.json(errors)
+else:
+    st.info("Start the bot to scan and rank markets automatically.")
+
+st.divider()
 
 # --------------------------------------------------
 # TRADE HISTORY
@@ -656,24 +563,16 @@ st.header(f"Trade history — {account_type.upper()}")
 
 try:
     summary = journal.summary(account_type=account_type)
-    c1, c2, c3, c4, c5 = st.columns(5)
+    trades = journal.list_trades(limit=200, account_type=account_type)
 
-    c1.metric("Total trades", summary.get("total_trades", 0))
-    c2.metric("Open", summary.get("open_trades", 0))
-    c3.metric("Wins", summary.get("wins", 0))
-    c4.metric("Losses", summary.get("losses", 0))
-
-    net_pl = summary.get("total_profit_loss", 0.0)
-    try:
-        net_pl_display = f"{float(net_pl):,.2f} {currency}".strip()
-    except (TypeError, ValueError):
-        net_pl_display = "Unavailable"
-
-    c5.metric("Net P/L", net_pl_display)
-
-    trades = journal.list_trades(
-        limit=200,
-        account_type=account_type,
+    a, b, c, d, e = st.columns(5)
+    a.metric("Total trades", summary.get("total_trades", 0))
+    b.metric("Open", summary.get("open_trades", 0))
+    c.metric("Wins", summary.get("wins", 0))
+    d.metric("Losses", summary.get("losses", 0))
+    e.metric(
+        "Net P/L",
+        money(summary.get("total_profit_loss", 0), currency),
     )
 
     if trades:
@@ -683,13 +582,14 @@ try:
             hide_index=True,
         )
     else:
-        st.info("No recorded trades for this account yet.")
+        st.info("No trades recorded yet.")
 
 except Exception as exc:
-    show_error("Could not load trade history", exc)
+    st.error(f"Could not load trade history: {exc}")
 
 st.caption(
-    "Trading involves risk. Historical digit statistics do not guarantee "
-    "future outcomes. Keep the bot stopped until Demo connection, proposals, "
-    "purchases, contract settlement, and risk controls have been verified."
+    "Important: TP and SL stop new entries based on realised session P/L. "
+    "They do not guarantee that open contracts can be sold at a target price. "
+    "Stopping the bot does not automatically close every open Deriv contract. "
+    "Verify all behavior on Demo before using a Real account."
 )
