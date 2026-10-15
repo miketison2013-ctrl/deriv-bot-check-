@@ -1,15 +1,11 @@
+"""Deriv Volatility digit-trading engine.
 
-"""Automatic Volatility digit-trading engine for Deriv.
-
-Scans supported Volatility markets, estimates digit probabilities,
-checks live proposals, applies risk controls, and records confirmed
-purchases and actual settlements.
-
-Historical frequencies are estimates, not reliable predictions.
+Historical digit frequencies are estimates, not reliable predictions.
 Real-money trading carries a risk of loss.
 """
 
 from datetime import datetime, timezone
+import json
 import math
 import time
 
@@ -17,12 +13,8 @@ from market_analyzer import analyse_market
 
 
 DIGIT_CONTRACTS = {
-    "DIGITOVER",
-    "DIGITUNDER",
-    "DIGITMATCH",
-    "DIGITDIFF",
-    "DIGITEVEN",
-    "DIGITODD",
+    "DIGITOVER", "DIGITUNDER", "DIGITMATCH",
+    "DIGITDIFF", "DIGITEVEN", "DIGITODD",
 }
 
 
@@ -31,14 +23,12 @@ class TradingEngine:
         self.client = client
         self.journal = journal
         self.running = False
-
         self.last_trade_time = 0.0
         self.last_loss_time = 0.0
         self.last_loss_key = None
         self.last_signal = "WAIT"
         self.last_action = "Ready"
         self.last_error = ""
-
         self.last_scan = []
         self.last_scan_errors = {}
         self.last_candidates = []
@@ -49,9 +39,7 @@ class TradingEngine:
     def _number(value, default=None):
         try:
             number = float(value)
-            if not math.isfinite(number):
-                return default
-            return number
+            return number if math.isfinite(number) else default
         except (TypeError, ValueError):
             return default
 
@@ -60,11 +48,9 @@ class TradingEngine:
         name = str(
             market.get("display_name")
             or market.get("underlying_symbol_name")
-            or market.get("symbol")
-            or ""
+            or market.get("symbol") or ""
         ).lower()
         symbol = str(market.get("symbol") or "").upper()
-
         return (
             "volatility" in name
             or symbol.startswith("R_")
@@ -73,8 +59,7 @@ class TradingEngine:
 
     def _trades(self, account_type):
         return self.journal.list_trades(
-            limit=1000,
-            account_type=account_type,
+            limit=1000, account_type=account_type
         )
 
     def _open_trades(self, account_type):
@@ -103,7 +88,6 @@ class TradingEngine:
                 )
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=timezone.utc)
-
                 if parsed.astimezone(timezone.utc).date() == today:
                     total += self._number(
                         trade.get("profit_loss"), 0.0
@@ -127,9 +111,7 @@ class TradingEngine:
                 )
             except Exception as exc:
                 self.last_error = (
-                    "Could not check contract {}: {}".format(
-                        contract_id, exc
-                    )
+                    f"Could not check contract {contract_id}: {exc}"
                 )
                 continue
 
@@ -176,20 +158,33 @@ class TradingEngine:
                 )
             except Exception as exc:
                 self.last_error = (
-                    "Could not record settlement for {}: {}".format(
-                        contract_id, exc
-                    )
+                    f"Could not record settlement for "
+                    f"{contract_id}: {exc}"
                 )
                 continue
 
             if settled:
                 if profit < 0:
                     self.last_loss_time = time.time()
+                    raw = trade.get("raw_data")
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except (TypeError, ValueError):
+                            raw = {}
+
+                    candidate_data = (
+                        raw.get("candidate", {})
+                        if isinstance(raw, dict)
+                        and isinstance(raw.get("candidate", {}), dict)
+                        else {}
+                    )
                     self.last_loss_key = (
                         trade.get("symbol"),
                         trade.get("contract_type"),
-                        trade.get("direction"),
+                        candidate_data.get("barrier"),
                     )
+
                 messages.append(
                     "{} {} P/L {:.2f}".format(
                         contract_id, final_status, profit
@@ -204,7 +199,7 @@ class TradingEngine:
         return messages
 
     def scan_markets(self, config):
-        """Read-only scan. No purchases occur in this method."""
+        """Scan supported Volatility digit markets without buying."""
         window = max(
             50, min(int(config.get("tick_sample_size", 150)), 500)
         )
@@ -226,11 +221,12 @@ class TradingEngine:
             and market.get("symbol")
         ]
 
-        # Put 1-second markets first, then scan a bounded number.
         markets.sort(
             key=lambda market: (
                 not str(market.get("symbol", "")).upper().startswith("1HZ"),
-                str(market.get("display_name", market.get("symbol", ""))).lower(),
+                str(
+                    market.get("display_name", market.get("symbol", ""))
+                ).lower(),
             )
         )
         markets = markets[:max_markets]
@@ -246,8 +242,8 @@ class TradingEngine:
 
                 if len(prices) < minimum_samples:
                     self.last_scan_errors[symbol] = (
-                        "Insufficient ticks: {} received; {} required."
-                        .format(len(prices), minimum_samples)
+                        f"Insufficient ticks: {len(prices)} received; "
+                        f"{minimum_samples} required."
                     )
                     continue
 
@@ -332,36 +328,43 @@ class TradingEngine:
                 for digit in range(10):
                     add(
                         "DIGITMATCH", digit, counts[digit],
-                        "Matches {}".format(digit)
+                        f"Matches {digit}"
                     )
                     add(
                         "DIGITDIFF", digit,
                         sample_size - counts[digit],
-                        "Differs {}".format(digit)
+                        f"Differs {digit}"
                     )
 
-                for barrier in range(10):
+                # Valid barriers only.
+                # Over 0-8; Under 1-9.
+                for barrier in range(0, 9):
                     add(
                         "DIGITOVER", barrier,
                         sum(counts[d] for d in range(barrier + 1, 10)),
-                        "Over {}".format(barrier)
+                        f"Over {barrier}"
                     )
+
+                for barrier in range(1, 10):
                     add(
                         "DIGITUNDER", barrier,
                         sum(counts[d] for d in range(0, barrier)),
-                        "Under {}".format(barrier)
+                        f"Under {barrier}"
                     )
 
-                even_count = sum(counts[d] for d in (0, 2, 4, 6, 8))
+                even_count = sum(
+                    counts[d] for d in (0, 2, 4, 6, 8)
+                )
                 add("DIGITEVEN", None, even_count, "Even")
-                add("DIGITODD", None, sample_size - even_count, "Odd")
+                add(
+                    "DIGITODD", None,
+                    sample_size - even_count, "Odd"
+                )
 
             except Exception as exc:
                 self.last_scan_errors[symbol] = str(exc)
 
         self.last_scan_time = datetime.now(timezone.utc).isoformat()
-
-        # This ordering is for inspection only; it is not a prediction.
         self.last_candidates.sort(
             key=lambda item: (
                 item["sample_size"],
@@ -380,10 +383,8 @@ class TradingEngine:
         }
 
     def run_cycle(self, config):
-        """Monitor settlements and buy at most one qualifying contract."""
-        account_type = str(
-            config.get("account_type", "")
-        ).lower()
+        """Monitor settlements and buy at most one eligible contract."""
+        account_type = str(config.get("account_type", "")).lower()
 
         if account_type not in ("demo", "real"):
             self.last_action = "Blocked: select Demo or Real account"
@@ -396,19 +397,24 @@ class TradingEngine:
                 self.last_action = "Stopped: monitoring open trades only"
                 return {"action": self.last_action}
 
-            if account_type == "real" and not config.get("allow_real", False):
+            if account_type == "real" and not config.get(
+                "allow_real", False
+            ):
                 self.last_action = "Blocked: confirm Real-account trading"
                 return {"action": self.last_action}
 
             stake = self._number(config.get("stake"))
             max_price = self._number(config.get("max_stake"))
             loss_limit = self._number(config.get("daily_loss_limit"))
+
             if (
                 stake is None or max_price is None or loss_limit is None
                 or stake <= 0 or max_price <= 0 or loss_limit <= 0
                 or stake > max_price
             ):
-                raise ValueError("Invalid stake, maximum price, or loss limit.")
+                raise ValueError(
+                    "Invalid stake, maximum price, or loss limit."
+                )
 
             currency = str(config.get("currency") or "").strip()
             if not currency:
@@ -420,7 +426,9 @@ class TradingEngine:
                 raise ValueError("Invalid duration.")
 
             max_open = max(1, int(config.get("max_open_trades", 1)))
-            cooldown = max(0, int(config.get("cooldown_seconds", 60)))
+            cooldown = max(
+                0, int(config.get("cooldown_seconds", 60))
+            )
             loss_cooldown = max(
                 0, int(config.get("loss_cooldown_seconds", 300))
             )
@@ -446,7 +454,9 @@ class TradingEngine:
             if str(balance.get("currency", "")).upper() != currency.upper():
                 raise ValueError("Selected account currency mismatch.")
 
-            available_balance = self._number(balance.get("balance"), 0.0)
+            available_balance = self._number(
+                balance.get("balance"), 0.0
+            )
             if stake > available_balance:
                 raise ValueError("Stake exceeds available balance.")
 
@@ -464,11 +474,25 @@ class TradingEngine:
 
             best = None
             proposal_errors = []
+            proposals_checked = 0
 
-            for candidate in candidates[:proposal_limit]:
+            for candidate in candidates:
+                loss_key = (
+                    candidate.get("symbol"),
+                    candidate.get("contract_type"),
+                    candidate.get("barrier"),
+                )
+                if loss_key == self.last_loss_key:
+                    continue
+
                 observed = candidate["observed_probability"]
                 if observed < minimum_probability:
                     continue
+
+                if proposals_checked >= proposal_limit:
+                    break
+
+                proposals_checked += 1
 
                 try:
                     proposal = self.client.get_proposal(
@@ -493,7 +517,6 @@ class TradingEngine:
                     ):
                         continue
 
-                    # Approximate break-even win probability.
                     break_even = ask / payout
                     n = candidate["sample_size"]
                     adjusted = (observed * n + 1.0) / (n + 2.0)
@@ -537,7 +560,6 @@ class TradingEngine:
                     "best_candidate": best,
                 }
 
-            # Do not immediately repeat the exact last losing setup.
             candidate_key = (
                 best["symbol"],
                 best["contract_type"],
@@ -567,9 +589,10 @@ class TradingEngine:
                 or ask <= 0 or ask > max_price
                 or ask > available_balance or payout <= ask
             ):
-                raise ValueError("Refreshed proposal failed price checks.")
+                raise ValueError(
+                    "Refreshed proposal failed price checks."
+                )
 
-            # Recheck risk limits immediately before purchase.
             if self._daily_net(account_type) <= -loss_limit:
                 raise ValueError("Daily loss limit reached before purchase.")
             if len(self._open_trades(account_type)) >= max_open:
@@ -584,19 +607,20 @@ class TradingEngine:
             if not contract_id:
                 raise ValueError("Purchase was not confirmed by Deriv.")
 
-            buy_price = self._number(
-                purchase.get("buy_price"), ask
-            )
+            buy_price = self._number(purchase.get("buy_price"), ask)
             entry_spot = self._number(
                 purchase.get("spot") or best.get("spot")
             )
+
             purchase_time = purchase.get("purchase_time")
             if purchase_time is not None:
                 try:
                     entry_time = datetime.fromtimestamp(
                         float(purchase_time), tz=timezone.utc
                     ).isoformat()
-                except (ValueError, TypeError, OSError, OverflowError):
+                except (
+                    ValueError, TypeError, OSError, OverflowError
+                ):
                     entry_time = datetime.now(timezone.utc).isoformat()
             else:
                 entry_time = datetime.now(timezone.utc).isoformat()
@@ -620,8 +644,9 @@ class TradingEngine:
                 buy_price=buy_price,
                 strategy="digit_frequency_proposal_filter",
                 notes=(
-                    "Estimated edge {:.4f}; not a guarantee."
-                    .format(best["estimated_edge"])
+                    "Estimated edge {:.4f}; not a guarantee.".format(
+                        best["estimated_edge"]
+                    )
                 ),
                 raw_data={
                     "candidate": best,
@@ -653,6 +678,7 @@ class TradingEngine:
         except Exception as exc:
             self.last_error = str(exc)
             self.last_action = "Cycle error: " + str(exc)
+            self.running = False
             return {
                 "action": self.last_action,
                 "error": self.last_error,
