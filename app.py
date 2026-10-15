@@ -7,13 +7,16 @@ from trading_engine import TradingEngine
 
 
 st.set_page_config(
-    page_title="Deriv Trading Bot",
+    page_title="Deriv Adaptive Trading Bot",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("📈 Deriv Trading Bot")
-st.caption("Market signals, automated trading, risk controls and trade journal")
+st.title("📈 Deriv Adaptive Trading Bot")
+st.caption(
+    "Account monitoring, volatility markets, digit analysis, "
+    "automated trading, learning and trade history"
+)
 
 # --------------------------------------------------
 # SESSION STATE
@@ -26,7 +29,8 @@ defaults = {
     "connected_account": None,
     "account_balance": None,
     "markets": [],
-    "last_cycle": {},
+    "connection_message": "",
+    "connection_error": "",
 }
 
 for key, value in defaults.items():
@@ -35,7 +39,7 @@ for key, value in defaults.items():
 
 
 # --------------------------------------------------
-# CONNECTION AND ACCOUNT SELECTION
+# CONNECTION
 # --------------------------------------------------
 
 st.sidebar.header("Deriv Connection")
@@ -52,10 +56,11 @@ token = st.sidebar.text_input(
 )
 
 account_type = st.sidebar.radio(
-    "Select ONE account",
+    "Select one account",
     ["demo", "real"],
     format_func=lambda value: (
-        "Demo account" if value == "demo"
+        "Demo account"
+        if value == "demo"
         else "REAL MONEY account"
     ),
     key="account_type_input",
@@ -65,35 +70,48 @@ real_confirm = False
 
 if account_type == "real":
     real_confirm = st.sidebar.checkbox(
-        "I understand that real trades can lose money.",
+        "I understand real trades can lose money",
         key="real_trading_confirmation",
     )
-
-connected = (
-    st.session_state.client is not None
-    and st.session_state.connected_account == account_type
-)
 
 if (
     st.session_state.client is not None
     and st.session_state.connected_account != account_type
 ):
-    st.session_state.engine.stop()
+    if st.session_state.engine is not None:
+        st.session_state.engine.stop()
+
+    st.session_state.client = None
+    st.session_state.engine = None
+    st.session_state.journal = None
+    st.session_state.connected_account = None
+    st.session_state.account_balance = None
+    st.session_state.markets = []
+
     st.warning(
-        "Your selected account has changed. Automation has been "
-        "stopped. Connect again to use the newly selected account."
+        "The account selection changed. Connect again to use "
+        "the newly selected account."
     )
 
-if st.sidebar.button("Connect to selected account", type="primary"):
+if st.sidebar.button(
+    "Connect to selected account",
+    type="primary",
+):
     if not app_id.strip() or not token.strip():
-        st.sidebar.error("Enter your App ID and personal access token.")
+        st.session_state.connection_error = (
+            "Enter your App ID and personal access token."
+        )
     elif account_type == "real" and not real_confirm:
-        st.sidebar.error("Confirm the real-account risk warning.")
+        st.session_state.connection_error = (
+            "Confirm the real-account risk warning first."
+        )
     else:
         try:
-            client = DerivClient(app_id.strip(), token.strip())
+            client = DerivClient(
+                app_id.strip(),
+                token.strip(),
+            )
 
-            # Verify access to the selected account only.
             balance = client.get_balance(account_type)
 
             journal = TradeJournal("trade_journal.db")
@@ -105,89 +123,214 @@ if st.sidebar.button("Connect to selected account", type="primary"):
             st.session_state.connected_account = account_type
             st.session_state.account_balance = balance
             st.session_state.markets = []
-            st.session_state.last_cycle = {}
-
-            st.sidebar.success(
-                f"Connected to the selected {account_type.upper()} account."
+            st.session_state.connection_error = ""
+            st.session_state.connection_message = (
+                f"Connected to the selected "
+                f"{account_type.upper()} account."
             )
 
+            st.rerun()
+
         except Exception as exc:
-            st.sidebar.error(f"Connection failed: {exc}")
+            st.session_state.connection_error = (
+                f"Connection failed: {exc}"
+            )
+
+if st.session_state.connection_error:
+    st.sidebar.error(st.session_state.connection_error)
+
+if st.session_state.connection_message:
+    st.sidebar.success(st.session_state.connection_message)
+
+st.sidebar.caption(
+    "Never paste your personal access token into source code "
+    "or commit it to GitHub."
+)
 
 
 # --------------------------------------------------
-# MAIN DASHBOARD
+# CONNECTION STATUS
 # --------------------------------------------------
+
+connected = (
+    st.session_state.client is not None
+    and st.session_state.engine is not None
+    and st.session_state.journal is not None
+    and st.session_state.connected_account == account_type
+)
 
 if not connected:
+    st.warning(
+        "Not connected. Choose an account in the sidebar and "
+        "connect before loading live account data."
+    )
+
+    st.subheader("Tool modules")
+
+    st.markdown(
+        "- Account balance and connection status\n"
+        "- Volatility market scanner\n"
+        "- Live tick and last-digit statistics\n"
+        "- Market and strategy rankings\n"
+        "- Automated trading with risk controls\n"
+        "- Trade history and performance learning"
+    )
+
     st.info(
-        "Choose Demo or Real, enter your Deriv credentials, "
-        "and connect to that account."
+        "The modules listed here describe the planned system. "
+        "Some require implementation in the supporting files "
+        "before they can produce live results."
     )
-    st.caption(
-        "Your personal access token is entered in the password field. "
-        "Never paste it into your source code or commit it to GitHub."
-    )
+
     st.stop()
 
 
 client = st.session_state.client
 engine = st.session_state.engine
 journal = st.session_state.journal
-
-st.subheader("Selected Account")
-
 balance = st.session_state.account_balance
-
-if balance:
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Account", account_type.upper())
-    col2.metric(
-        "Balance",
-        f"{balance['balance']:.2f} {balance['currency']}",
-    )
-    col3.metric("Account ID", str(balance["account_id"]))
-
-if st.button("Refresh selected account balance"):
-    try:
-        balance = client.get_balance(account_type)
-        st.session_state.account_balance = balance
-        st.rerun()
-    except Exception as exc:
-        st.error(f"Balance refresh failed: {exc}")
 
 
 # --------------------------------------------------
-# MARKETS
+# ACCOUNT OVERVIEW
+# --------------------------------------------------
+
+st.header("Account Overview")
+
+refresh_col, account_col = st.columns([1, 2])
+
+with refresh_col:
+    if st.button("Refresh balance"):
+        try:
+            st.session_state.account_balance = (
+                client.get_balance(account_type)
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Balance refresh failed: {exc}")
+
+balance = st.session_state.account_balance or {}
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric("Selected account", account_type.upper())
+
+if balance:
+    col2.metric(
+        "Balance",
+        "{} {}".format(
+            balance.get("balance", "Unavailable"),
+            balance.get("currency", ""),
+        ),
+    )
+    col3.metric(
+        "Account ID",
+        str(balance.get("account_id", "Unavailable")),
+    )
+else:
+    col2.metric("Balance", "Unavailable")
+    col3.metric("Account ID", "Unavailable")
+
+
+# --------------------------------------------------
+# MARKET SCANNER
 # --------------------------------------------------
 
 st.divider()
-st.subheader("Market Selection")
+st.header("Volatility Market Scanner")
 
-if st.button("Load available markets"):
-    try:
-        st.session_state.markets = client.get_active_symbols()
-    except Exception as exc:
-        st.error(f"Could not load markets: {exc}")
-
-markets = st.session_state.markets
-
-if not markets:
-    st.info("Load markets to choose a trading symbol.")
-    st.stop()
-
-market_labels = {
-    f"{market['display_name']} ({market['symbol']})": market["symbol"]
-    for market in markets
-}
-
-selected_label = st.selectbox(
-    "Market",
-    options=list(market_labels.keys()),
+st.write(
+    "Load the symbols returned by Deriv. The complete scanner "
+    "will analyse each eligible market independently."
 )
 
-selected_symbol = market_labels[selected_label]
+if st.button("Load or refresh available markets"):
+    try:
+        st.session_state.markets = client.get_active_symbols()
+        if not st.session_state.markets:
+            st.warning("Deriv returned no available markets.")
+    except Exception as exc:
+        st.error(f"Market loading failed: {exc}")
+
+markets = st.session_state.markets or []
+
+if markets:
+    market_frame = pd.DataFrame(markets)
+
+    if "symbol" in market_frame.columns:
+        market_frame = market_frame.drop_duplicates(
+            subset=["symbol"]
+        )
+
+    st.metric("Markets returned by Deriv", len(market_frame))
+
+    st.dataframe(
+        market_frame,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    symbol_options = [
+        market["symbol"]
+        for market in markets
+        if market.get("symbol")
+    ]
+
+    if symbol_options:
+        selected_symbol = st.selectbox(
+            "Current strategy market",
+            symbol_options,
+        )
+    else:
+        selected_symbol = None
+
+else:
+    selected_symbol = None
+    st.info(
+        "No markets loaded yet. Use the button above. "
+        "The rest of the dashboard remains available."
+    )
+
+
+# --------------------------------------------------
+# ANALYSIS DASHBOARD
+# --------------------------------------------------
+
+st.divider()
+st.header("Market Analysis")
+
+analysis_tabs = st.tabs(
+    [
+        "Last digits",
+        "Digit rankings",
+        "Volatility rankings",
+        "Strategy performance",
+    ]
+)
+
+with analysis_tabs[0]:
+    st.info(
+        "Live tick collection and rolling last-digit frequencies "
+        "must be connected to the market-data module."
+    )
+
+with analysis_tabs[1]:
+    st.info(
+        "Digit rankings require collected tick samples, sample "
+        "sizes, frequency percentages and statistical validation."
+    )
+
+with analysis_tabs[2]:
+    st.info(
+        "Volatility-market rankings require comparable live "
+        "statistics for each eligible symbol."
+    )
+
+with analysis_tabs[3]:
+    st.info(
+        "Learning scores must be calculated from recorded and "
+        "confirmed trade outcomes, not assumed results."
+    )
 
 
 # --------------------------------------------------
@@ -195,7 +338,7 @@ selected_symbol = market_labels[selected_label]
 # --------------------------------------------------
 
 st.divider()
-st.subheader("Trading Settings")
+st.header("Trading Settings")
 
 col1, col2 = st.columns(2)
 
@@ -204,7 +347,8 @@ with col1:
         "Trade direction",
         ["CALL", "PUT"],
         format_func=lambda value: (
-            "Rise (CALL)" if value == "CALL"
+            "Rise (CALL)"
+            if value == "CALL"
             else "Fall (PUT)"
         ),
     )
@@ -249,7 +393,6 @@ with col2:
         value=5.0,
         step=0.5,
         format="%.2f",
-        help="Automation stops opening new trades after this daily net loss.",
     )
 
     max_open_trades = st.number_input(
@@ -274,62 +417,71 @@ with col2:
         step=30,
     )
 
-    st.text_input(
-        "Account currency",
-        value=balance["currency"],
-        disabled=True,
-    )
+    if balance.get("currency"):
+        st.text_input(
+            "Account currency",
+            value=str(balance["currency"]),
+            disabled=True,
+        )
 
 
 # --------------------------------------------------
-# AUTOMATION CONTROLS
+# START AND STOP
 # --------------------------------------------------
 
 st.divider()
-st.subheader("Automation")
+st.header("Automation Controls")
 
 if account_type == "real":
     st.warning(
-        "REAL ACCOUNT: enabling automation can purchase contracts "
-        "using real money. Losses are possible."
+        "REAL MONEY ACCOUNT: starting automation can purchase "
+        "contracts with real money. Losses are possible."
     )
 
 start_col, stop_col = st.columns(2)
 
 with start_col:
-    if st.button("▶ Start automation", type="primary"):
-        if stake > max_stake:
-            st.error("Stake cannot exceed the maximum purchase price.")
-        elif stake > balance["balance"]:
-            st.error("Stake exceeds the selected account balance.")
+    if st.button(
+        "▶ Start automation",
+        type="primary",
+        use_container_width=True,
+    ):
+        if selected_symbol is None:
+            st.error("Load markets and select a market first.")
+        elif stake > max_stake:
+            st.error(
+                "Stake cannot exceed the maximum purchase price."
+            )
+        elif stake > float(balance.get("balance", 0)):
+            st.error("Stake exceeds the available balance.")
         elif account_type == "real" and not real_confirm:
-            st.error("Confirm the real-account risk warning first.")
+            st.error("Confirm the real-account risk warning.")
         else:
             engine.start()
-            st.success("Automation enabled for the selected account.")
+            st.success(
+                "Automation enabled. The current engine still "
+                "uses its implemented strategy; multi-market "
+                "selection will be added in the next steps."
+            )
             st.rerun()
 
 with stop_col:
-    if st.button("■ Stop automation"):
+    if st.button(
+        "■ Stop automation",
+        use_container_width=True,
+    ):
         engine.stop()
-        st.info(
-            "New entries stopped. The bot can still monitor and record "
-            "settlements for open trades."
+        st.warning(
+            "New entries stopped. Already purchased contracts "
+            "may remain open until settled."
         )
         st.rerun()
 
-
-# --------------------------------------------------
-# AUTOMATED MONITORING
-# --------------------------------------------------
-
 config = {
     "account_type": account_type,
-    "allow_real": (
-        account_type == "real" and real_confirm
-    ),
+    "allow_real": account_type == "real" and real_confirm,
     "symbol": selected_symbol,
-    "currency": balance["currency"],
+    "currency": balance.get("currency"),
     "contract_type": contract_type,
     "stake": stake,
     "max_stake": max_stake,
@@ -341,74 +493,89 @@ config = {
     "duration_unit": duration_unit,
 }
 
-@st.fragment(run_every="5s")
-def monitor_bot():
-    current_engine = st.session_state.engine
+st.subheader("Live Bot Status")
 
-    if current_engine is None:
-        st.info("Connect to an account to begin.")
-        return
+status_col1, status_col2, status_col3 = st.columns(3)
 
-    # Never run cycles against an account other than the connected one.
-    if st.session_state.connected_account != account_type:
-        current_engine.stop()
-        st.error("Account selection changed. Reconnect before continuing.")
-        return
+status_col1.metric(
+    "Automation",
+    "RUNNING" if engine.running else "STOPPED",
+)
+status_col2.metric(
+    "Selected market",
+    selected_symbol or "None",
+)
+status_col3.metric(
+    "Selected account",
+    account_type.upper(),
+)
 
-    result = current_engine.run_cycle(config)
-    st.session_state.last_cycle = result
+if selected_symbol:
+    try:
+        result = engine.run_cycle(config)
 
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Automation",
-        "RUNNING" if current_engine.running else "STOPPED",
-    )
-    col2.metric(
-        "Current signal",
-        current_engine.last_signal,
-    )
-    col3.metric(
-        "Open trades",
-        len(current_engine._open_trades(account_type)),
-    )
-
-    st.write("**Latest action:**", current_engine.last_action)
-
-    if current_engine.last_error:
-        st.error(current_engine.last_error)
-
-    if result.get("contract_id"):
-        st.success(
-            f"Deriv confirmed contract ID: {result['contract_id']}"
+        st.write(
+            "**Latest action:**",
+            engine.last_action,
         )
 
-monitor_bot()
+        st.write(
+            "**Current signal:**",
+            engine.last_signal,
+        )
+
+        if engine.last_error:
+            st.error(engine.last_error)
+
+        if result.get("contract_id"):
+            st.success(
+                "Confirmed contract ID: "
+                + str(result["contract_id"])
+            )
+
+    except Exception as exc:
+        st.error(f"Bot monitoring error: {exc}")
+else:
+    st.info(
+        "The engine is waiting for a market to be selected. "
+        "No new trade can be placed without a selected market."
+    )
 
 
 # --------------------------------------------------
-# TRADE JOURNAL
+# TRADE HISTORY
 # --------------------------------------------------
 
 st.divider()
-st.subheader(f"Trade Journal — {account_type.upper()}")
+st.header(f"Trade History — {account_type.upper()}")
 
 try:
-    trades = journal.list_trades(
-        limit=100,
-        account_type=account_type,
-    )
-
     summary = journal.summary(account_type=account_type)
 
     col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric("Total trades", summary["total_trades"] or 0)
-    col2.metric("Wins", summary["wins"] or 0)
-    col3.metric("Losses", summary["losses"] or 0)
+    col1.metric(
+        "Total trades",
+        summary.get("total_trades") or 0,
+    )
+    col2.metric(
+        "Wins",
+        summary.get("wins") or 0,
+    )
+    col3.metric(
+        "Losses",
+        summary.get("losses") or 0,
+    )
     col4.metric(
         "Net profit/loss",
-        f"{summary['total_profit_loss']:.2f}",
+        "{:.2f}".format(
+            summary.get("total_profit_loss") or 0
+        ),
+    )
+
+    trades = journal.list_trades(
+        limit=200,
+        account_type=account_type,
     )
 
     if trades:
@@ -418,15 +585,17 @@ try:
             hide_index=True,
         )
     else:
-        st.info("No trades recorded for this account yet.")
+        st.info(
+            "No recorded trades for this account yet."
+        )
 
 except Exception as exc:
-    st.error(f"Could not load the trade journal: {exc}")
+    st.error(f"Could not load trade history: {exc}")
 
 
 st.caption(
-    "Signals use a moving-average crossover. This is not a guarantee "
-    "of profitable entries. Keep the app running to maintain its "
-    "automatic monitoring cycle. Existing open contracts may continue "
-    "until they settle, even after new entries are stopped."
+    "This dashboard does not guarantee profitable trades. "
+    "The app must remain active for its current monitoring cycle. "
+    "The multi-market scanner, digit analysis and learning system "
+    "will be implemented and tested in the supporting modules."
 )
