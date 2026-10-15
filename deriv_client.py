@@ -1,3 +1,4 @@
+
 import json
 import math
 import requests
@@ -5,7 +6,6 @@ import websocket
 
 
 API_BASE = "https://api.derivws.com"
-
 PUBLIC_WS = (
     "wss://api.derivws.com/"
     "trading/v1/options/ws/public"
@@ -58,10 +58,12 @@ class DerivClient:
                 )
 
                 if response.status_code == 401:
-                    message = "Authentication failed. Check your token."
+                    message = (
+                        "Authentication failed. Check your token."
+                    )
                 elif response.status_code == 403:
                     message = (
-                        "Access denied. Check your token permissions "
+                        "Access denied. Check token permissions "
                         "and App ID."
                     )
 
@@ -132,7 +134,7 @@ class DerivClient:
         if not accounts:
             raise DerivAPIError(
                 "No Options accounts were returned. "
-                "Check your token permissions and account access."
+                "Check token permissions and account access."
             )
 
         return accounts
@@ -141,8 +143,7 @@ class DerivClient:
         wanted = str(account_type).lower()
 
         matches = [
-            account
-            for account in self.get_accounts()
+            account for account in self.get_accounts()
             if account.get("account_type") == wanted
         ]
 
@@ -276,7 +277,6 @@ class DerivClient:
                 item.get("underlying_symbol")
                 or item.get("symbol")
             )
-
             name = (
                 item.get("underlying_symbol_name")
                 or item.get("display_name")
@@ -294,6 +294,14 @@ class DerivClient:
             markets.values(),
             key=lambda item: item["display_name"].lower(),
         )
+
+    @staticmethod
+    def _price_text(price):
+        """Keep the original quote representation where possible."""
+        if isinstance(price, str):
+            return price.strip()
+
+        return str(price)
 
     def get_recent_ticks(self, symbol, count=100):
         ws = self._open_public()
@@ -316,7 +324,7 @@ class DerivClient:
 
         return {
             "prices": [
-                float(price)
+                self._price_text(price)
                 for price in history.get("prices", [])
             ],
             "times": history.get("times", []),
@@ -344,10 +352,9 @@ class DerivClient:
 
             return {
                 "symbol": symbol,
-                "quote": float(tick["quote"]),
+                "quote": self._price_text(tick["quote"]),
                 "epoch": tick.get("epoch"),
             }
-
         finally:
             ws.close()
 
@@ -397,7 +404,7 @@ class DerivClient:
         duration_unit="t",
         barrier=None,
     ):
-        """Request a real proposal; this does not buy a contract."""
+        """Request a proposal without purchasing a contract."""
         try:
             amount = float(amount)
             duration = int(duration)
@@ -417,20 +424,13 @@ class DerivClient:
             )
 
         allowed = {
-            "DIGITOVER",
-            "DIGITUNDER",
-            "DIGITMATCH",
-            "DIGITDIFF",
-            "DIGITEVEN",
-            "DIGITODD",
-            "CALL",
-            "PUT",
+            "DIGITOVER", "DIGITUNDER", "DIGITMATCH",
+            "DIGITDIFF", "DIGITEVEN", "DIGITODD",
+            "CALL", "PUT",
         }
 
         if contract_type not in allowed:
-            raise DerivAPIError(
-                "Unsupported contract type."
-            )
+            raise DerivAPIError("Unsupported contract type.")
 
         if duration_unit not in ("t", "s", "m"):
             raise DerivAPIError(
@@ -438,10 +438,8 @@ class DerivClient:
             )
 
         digit_types = {
-            "DIGITOVER",
-            "DIGITUNDER",
-            "DIGITMATCH",
-            "DIGITDIFF",
+            "DIGITOVER", "DIGITUNDER",
+            "DIGITMATCH", "DIGITDIFF",
         }
 
         if contract_type in digit_types:
@@ -449,7 +447,6 @@ class DerivClient:
                 raise DerivAPIError(
                     "This digit contract requires a barrier from 0 to 9."
                 )
-
             try:
                 barrier = int(barrier)
             except (TypeError, ValueError):
@@ -514,7 +511,7 @@ class DerivClient:
         proposal_id,
         maximum_price,
     ):
-        """Buy a contract from a proposal after explicit user approval."""
+        """Buy only after the calling engine authorizes the purchase."""
         try:
             maximum_price = float(maximum_price)
         except (TypeError, ValueError):
@@ -567,7 +564,6 @@ class DerivClient:
         }
 
     def get_open_contract(self, account_type, contract_id):
-        """Fetch the latest status of an actual Deriv contract."""
         try:
             contract_id = int(contract_id)
         except (TypeError, ValueError):
@@ -608,7 +604,6 @@ class DerivClient:
         contract_id,
         price=0,
     ):
-        """Ask Deriv to sell an open contract at the offered price."""
         try:
             contract_id = int(contract_id)
             price = float(price)
