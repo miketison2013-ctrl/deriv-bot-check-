@@ -1,9 +1,4 @@
-
-"""Deriv volatility digit trading engine.
-
-Uses observed digit frequencies and live proposals as filters, not guarantees.
-Keep Demo selected while testing. Trading can lose money.
-"""
+"""Deriv digit trading engine with normalized market scanning and risk checks."""
 
 from datetime import datetime, timezone
 import json
@@ -43,20 +38,87 @@ class TradingEngine:
     @staticmethod
     def _number(value, default=None):
         try:
-            number = float(value)
-            return number if math.isfinite(number) else default
+            result = float(value)
+            return result if math.isfinite(result) else default
         except (TypeError, ValueError, OverflowError):
             return default
 
     @staticmethod
+    def _dict(value):
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _prices_from_ticks(data):
+        """Accept a tick list, prices list, or nested history response."""
+        if isinstance(data, dict):
+            history = data.get("history")
+            if isinstance(history, dict):
+                data = history.get("prices", [])
+            else:
+                data = data.get("prices", data.get("ticks", []))
+
+        if not isinstance(data, (list, tuple)):
+            return []
+
+        prices = []
+        for item in data:
+            if isinstance(item, dict):
+                value = item.get("price", item.get("quote"))
+            else:
+                value = item
+
+            try:
+                number = float(value)
+                if math.isfinite(number) and number > 0:
+                    prices.append(str(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+        return prices
+
+    @staticmethod
+    def _contract_codes(data):
+        """Normalize contract type responses into Deriv contract codes."""
+        if isinstance(data, dict):
+            if isinstance(data.get("available"), list):
+                data = data["available"]
+            elif isinstance(data.get("contracts"), list):
+                data = data["contracts"]
+            else:
+                data = list(data.values())
+
+        if not isinstance(data, (list, tuple, set)):
+            return set()
+
+        codes = set()
+        for item in data:
+            if isinstance(item, dict):
+                code = item.get(
+                    "contract_type", item.get("contractType")
+                )
+            else:
+                code = item
+
+            if code:
+                code = str(code).strip().upper()
+                if code in DIGIT_CONTRACTS:
+                    codes.add(code)
+
+        return codes
+
+    @staticmethod
     def _is_volatility_market(market):
+        if not isinstance(market, dict):
+            return False
+
+        symbol = str(market.get("symbol") or "").upper()
         name = str(
             market.get("display_name")
             or market.get("underlying_symbol_name")
-            or market.get("symbol")
+            or market.get("name")
             or ""
         ).lower()
-        symbol = str(market.get("symbol") or "").upper()
+
         return (
             "volatility" in name
             or symbol.startswith("R_")
@@ -64,15 +126,17 @@ class TradingEngine:
         )
 
     def _trades(self, account_type):
-        return self.journal.list_trades(
+        result = self.journal.list_trades(
             limit=1000,
             account_type=account_type,
         )
+        return result if isinstance(result, list) else []
 
     def _open_trades(self, account_type):
         return [
             trade for trade in self._trades(account_type)
-            if str(trade.get("status", "")).upper() == "OPEN"
+            if isinstance(trade, dict)
+            and str(trade.get("status", "")).upper() == "OPEN"
         ]
 
     def _daily_net(self, account_type):
@@ -95,6 +159,7 @@ class TradingEngine:
                 )
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=timezone.utc)
+
                 if parsed.astimezone(timezone.utc).date() == today:
                     total += self._number(
                         trade.get("profit_loss"), 0.0
@@ -106,6 +171,7 @@ class TradingEngine:
 
     def _remember_loss(self, trade):
         raw = trade.get("raw_data") or {}
+
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -128,7 +194,7 @@ class TradingEngine:
         self.last_loss_time = time.time()
 
     def monitor_open_trades(self, account_type):
-        """Check Deriv for confirmed settlement of journalled contracts."""
+        """Monitor contracts and record confirmed settlements."""
         messages = []
 
         for trade in self._open_trades(account_type):
@@ -137,9 +203,12 @@ class TradingEngine:
                 continue
 
             try:
-                details = self.client.get_open_contract(
-                    account_type, contract_id
+                details = self._dict(
+                    self.client.get_open_contract(
+                        account_type, contract_id
+                    )
                 )
+
                 status = str(details.get("status", "")).lower()
                 sold = details.get("is_sold") in (1, True, "1")
 
@@ -173,8 +242,7 @@ class TradingEngine:
                     profit_loss=profit,
                     payout=self._number(details.get("payout")),
                     exit_spot=self._number(
-                        details.get("exit_tick")
-                        or details.get("exit_spot")
+                        details.get("exit_tick", details.get("exit_spot"))
                     ),
                     exit_time=datetime.now(timezone.utc).isoformat(),
                     raw_data=details,
@@ -198,8 +266,9 @@ class TradingEngine:
         return messages
 
     def scan_markets(self, config=None):
-        """Rank volatility markets and digit setups without placing trades."""
+        """Scan volatility markets and rank digit-contract candidates."""
         config = config or {}
+
         window = max(
             50, min(int(config.get("tick_sample_size", 150)), 500)
         )
@@ -215,47 +284,65 @@ class TradingEngine:
         self.last_candidates = []
 
         markets = self.client.get_active_symbols()
+        if not isinstance(markets, (list, tuple)):
+            raise ValueError("Active markets response is not a list.")
+
         markets = [
             market for market in markets
             if isinstance(market, dict)
             and market.get("symbol")
             and self._is_volatility_market(market)
         ]
+
         markets.sort(
             key=lambda item: (
                 not str(item.get("symbol", "")).upper().startswith("1HZ"),
-                str(item.get("display_name", item.get("symbol", ""))).lower(),
+                str(
+                    item.get("display_name")
+                    or item.get("name")
+                    or item.get("symbol")
+                ).lower(),
             )
         )
 
         for market in markets[:max_markets]:
-            symbol = market["symbol"]
+            symbol = str(market["symbol"])
 
             try:
                 tick_data = self.client.get_recent_ticks(
                     symbol, count=window
                 )
-                prices = tick_data.get("prices", [])
+                prices = self._prices_from_ticks(tick_data)
+
                 if len(prices) < minimum_samples:
                     self.last_scan_errors[symbol] = (
-                        f"Only {len(prices)} ticks; "
+                        f"Only {len(prices)} valid ticks; "
                         f"{minimum_samples} required."
                     )
                     continue
 
-                analysis = analyse_market(
-                    prices, symbol=symbol, window=window
+                analysis = self._dict(
+                    analyse_market(prices, symbol=symbol, window=window)
                 )
-                digit_data = analysis.get("digits", {})
-                sample_size = int(digit_data.get("sample_size", 0))
+                digit_data = self._dict(analysis.get("digits"))
                 rows = digit_data.get("counts", [])
+                sample_size = int(
+                    digit_data.get("sample_size", len(prices)) or 0
+                )
 
-                by_digit = {
-                    int(row["digit"]): row
-                    for row in rows
-                    if isinstance(row, dict)
-                    and row.get("digit") is not None
-                }
+                if not isinstance(rows, list):
+                    raise ValueError("Digit statistics are not a list.")
+
+                by_digit = {}
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        digit = int(row["digit"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if 0 <= digit <= 9:
+                        by_digit[digit] = row
 
                 if sample_size < minimum_samples or len(by_digit) != 10:
                     self.last_scan_errors[symbol] = (
@@ -263,48 +350,41 @@ class TradingEngine:
                     )
                     continue
 
-                available = self.client.get_contract_types(symbol)
-                if isinstance(available, dict):
-                    supported = set(available.values()).intersection(
-                        DIGIT_CONTRACTS
-                    )
-                else:
-                    supported = set(available or []).intersection(
-                        DIGIT_CONTRACTS
-                    )
+                supported = self._contract_codes(
+                    self.client.get_contract_types(symbol)
+                )
 
                 counts = {
-                    digit: int(by_digit[digit].get("count", 0))
+                    digit: int(by_digit[digit].get("count", 0) or 0)
                     for digit in range(10)
                 }
 
-                result = {
+                price_data = self._dict(analysis.get("price"))
+                momentum_data = self._dict(analysis.get("momentum"))
+
+                self.last_scan.append({
                     "symbol": symbol,
                     "display_name": (
                         market.get("display_name")
                         or market.get("underlying_symbol_name")
+                        or market.get("name")
                         or symbol
                     ),
                     "market_category": (
                         "1-second Volatility"
-                        if symbol.upper().startswith("1HZ")
+                        if symbol.startswith("1HZ")
                         else "Standard Volatility"
                     ),
                     "sample_size": sample_size,
-                    "latest_price": analysis.get(
-                        "price", {}
-                    ).get("latest_price"),
+                    "latest_price": price_data.get("latest_price"),
                     "digit_counts": rows,
                     "supported_digit_contracts": sorted(supported),
-                    "momentum": analysis.get(
-                        "momentum", {}
-                    ).get("signal", "UNKNOWN"),
-                }
-                self.last_scan.append(result)
+                    "momentum": momentum_data.get("signal", "UNKNOWN"),
+                })
 
                 if not supported:
                     self.last_scan_errors[symbol] = (
-                        "No supported digit contracts reported by Deriv."
+                        "No supported digit contracts returned by Deriv."
                     )
                     continue
 
@@ -354,8 +434,6 @@ class TradingEngine:
             except Exception as exc:
                 self.last_scan_errors[symbol] = str(exc)
 
-        # Rank by sample size and distance from 50/50 for inspection only.
-        # The live proposal and estimated edge are checked before a purchase.
         self.last_candidates.sort(
             key=lambda item: (
                 item["sample_size"],
@@ -363,6 +441,7 @@ class TradingEngine:
             ),
             reverse=True,
         )
+
         self.last_scan_time = datetime.now(timezone.utc).isoformat()
 
         return {
@@ -375,7 +454,7 @@ class TradingEngine:
         }
 
     def run_cycle(self, config=None):
-        """Monitor open trades and, when enabled, consider at most one entry."""
+        """Monitor open trades and consider at most one new entry."""
         config = config or {}
         account_type = str(config.get("account_type", "")).lower()
 
@@ -397,12 +476,15 @@ class TradingEngine:
             stake = self._number(config.get("stake"))
             max_price = self._number(config.get("max_stake"))
             loss_limit = self._number(config.get("daily_loss_limit"))
+
             if (
                 stake is None or max_price is None or loss_limit is None
                 or stake <= 0 or max_price <= 0 or loss_limit <= 0
                 or stake > max_price
             ):
-                raise ValueError("Check stake, maximum price and loss limit.")
+                raise ValueError(
+                    "Check stake, maximum purchase price and loss limit."
+                )
 
             currency = str(config.get("currency") or "").strip()
             if not currency:
@@ -435,7 +517,7 @@ class TradingEngine:
                 self.last_action = "Waiting: loss cooldown."
                 return {"action": self.last_action}
 
-            balance = self.client.get_balance(account_type)
+            balance = self._dict(self.client.get_balance(account_type))
             if str(balance.get("currency", "")).upper() != currency.upper():
                 raise ValueError("Selected account currency mismatch.")
 
@@ -455,7 +537,7 @@ class TradingEngine:
                 config.get("minimum_estimated_edge"), 0.02
             )
 
-            checked_proposals = []
+            checked = []
             proposal_errors = []
 
             for candidate in candidates:
@@ -468,11 +550,11 @@ class TradingEngine:
                     continue
                 if candidate["observed_probability"] < min_probability:
                     continue
-                if len(checked_proposals) >= proposal_limit:
+                if len(checked) >= proposal_limit:
                     break
 
                 try:
-                    proposal = self.client.get_proposal(
+                    proposal = self._dict(self.client.get_proposal(
                         account_type=account_type,
                         symbol=candidate["symbol"],
                         contract_type=candidate["contract_type"],
@@ -481,7 +563,8 @@ class TradingEngine:
                         duration=duration,
                         duration_unit=duration_unit,
                         barrier=candidate.get("barrier"),
-                    )
+                    ))
+
                     ask = self._number(proposal.get("ask_price"))
                     payout = self._number(proposal.get("payout"))
                     proposal_id = proposal.get("proposal_id")
@@ -499,7 +582,7 @@ class TradingEngine:
                     adjusted = (observed * n + 1.0) / (n + 2.0)
                     edge = adjusted - break_even
 
-                    checked_proposals.append({
+                    checked.append({
                         **candidate,
                         "proposal_id": proposal_id,
                         "ask_price": ask,
@@ -515,16 +598,16 @@ class TradingEngine:
                         f"{candidate['description']}: {exc}"
                     )
 
-            checked_proposals.sort(
+            checked.sort(
                 key=lambda item: item["estimated_edge"],
                 reverse=True,
             )
-            best = checked_proposals[0] if checked_proposals else None
+            best = checked[0] if checked else None
 
             if best is None or best["estimated_edge"] < min_edge:
                 self.last_signal = "WAIT"
                 self.last_action = (
-                    "No setup passed the current proposal and edge filters."
+                    "No setup passed the proposal and edge filters."
                 )
                 self.last_error = "; ".join(proposal_errors[:3])
                 return {
@@ -534,8 +617,8 @@ class TradingEngine:
                     "best_candidate": best,
                 }
 
-            # Refresh the selected proposal immediately before buying.
-            proposal = self.client.get_proposal(
+            # Refresh the proposal before purchasing.
+            proposal = self._dict(self.client.get_proposal(
                 account_type=account_type,
                 symbol=best["symbol"],
                 contract_type=best["contract_type"],
@@ -544,7 +627,8 @@ class TradingEngine:
                 duration=duration,
                 duration_unit=duration_unit,
                 barrier=best.get("barrier"),
-            )
+            ))
+
             proposal_id = proposal.get("proposal_id")
             ask = self._number(proposal.get("ask_price"))
             payout = self._number(proposal.get("payout"))
@@ -556,23 +640,24 @@ class TradingEngine:
             ):
                 raise ValueError("Updated proposal failed purchase checks.")
 
-            # Recheck risk limits immediately before the purchase.
             if self._daily_net(account_type) <= -loss_limit:
                 raise ValueError("Daily loss limit reached before purchase.")
             if len(self._open_trades(account_type)) >= max_open:
                 raise ValueError("Open-trade limit reached before purchase.")
 
-            purchase = self.client.buy_contract(
+            purchase = self._dict(self.client.buy_contract(
                 account_type=account_type,
                 proposal_id=proposal_id,
                 maximum_price=ask,
-            )
+            ))
+
             contract_id = purchase.get("contract_id")
             if not contract_id:
                 raise ValueError("Deriv did not confirm the purchase.")
 
             buy_price = self._number(purchase.get("buy_price"), ask)
             purchase_time = purchase.get("purchase_time")
+
             try:
                 entry_time = (
                     datetime.fromtimestamp(
@@ -584,7 +669,6 @@ class TradingEngine:
             except (ValueError, TypeError, OSError, OverflowError):
                 entry_time = datetime.now(timezone.utc).isoformat()
 
-            # Only record an open trade after Deriv confirms a contract ID.
             self.journal.record_open_trade(
                 contract_id=str(contract_id),
                 account_type=account_type,
@@ -607,10 +691,7 @@ class TradingEngine:
                     f"Estimated edge {best['estimated_edge']:.4f}; "
                     "historical frequency is not a guarantee."
                 ),
-                raw_data={
-                    "candidate": best,
-                    "purchase": purchase,
-                },
+                raw_data={"candidate": best, "purchase": purchase},
             )
 
             self.last_trade_time = time.time()
